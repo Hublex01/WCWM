@@ -5,6 +5,9 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <sstream>
+#include <iomanip>
+#include <string>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // КОНФИГУРАЦИЯ
@@ -19,7 +22,7 @@ const int THREAD_SLEEP_MS = 8;
 // ═══════════════════════════════════════════════════════════════════════════════
 struct WindowSnapshot {
     HWND hwnd;
-    int  baseX, baseY; // Позиция относительно начала холста (без учета камеры)
+    int  baseX, baseY; 
     int  width, height;
 };
 
@@ -29,7 +32,6 @@ struct WindowMoveOp {
     UINT flags;
 };
 
-// Контекст для безопасного снимка
 struct SnapshotCtx {
     std::vector<WindowSnapshot>* list;
     POINT offset;
@@ -49,17 +51,22 @@ std::atomic<bool> g_stop(false);
 
 HHOOK g_mouseHook = NULL;
 HHOOK g_kbHook = NULL;
-HWND g_hwnd = NULL;
+HWND g_hwnd = NULL;       // Основное прозрачное окно
+HWND g_debugHwnd = NULL;  // Окно отладки
 
 // Система камеры
-POINT g_camOffset = {0, 0}; // Текущее смещение камеры
+POINT g_camOffset = {0, 0};
 
 // Система анимации
 std::atomic<bool> g_isAnim(false);
 POINT g_animStart = {0, 0};
 POINT g_animTarget = {0, 0};
 std::chrono::steady_clock::time_point g_animTime;
-const int ANIM_DURATION = 400; // мс
+const int ANIM_DURATION = 400;
+
+// Текст для отладки (буфер)
+std::wstring g_debugText = L"";
+CRITICAL_SECTION g_debugLock;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // УТИЛИТЫ
@@ -90,18 +97,172 @@ void RunAsAdmin() {
 }
 
 bool IsValidWnd(HWND h) {
-    if (!h || h == g_hwnd || !IsWindowVisible(h)) return false;
-    RECT r; GetWindowRect(h, &r);
-    if ((r.right - r.left >= GetSystemMetrics(SM_CXSCREEN)) && 
-        (r.bottom - r.top >= GetSystemMetrics(SM_CYSCREEN))) return false;
+    if (!h || h == g_hwnd) return false;
     
+    // 1. Проверка видимости
+    if (!IsWindowVisible(h)) return false;
+
+    // 2. Проверка на весь экран (исключаем игры и видео на весь экран)
+    RECT r; 
+    GetWindowRect(h, &r);
+    int w = r.right - r.left;
+    int hgt = r.bottom - r.top;
+    
+    if (w >= GetSystemMetrics(SM_CXSCREEN) && hgt >= GetSystemMetrics(SM_CYSCREEN)) 
+        return false;
+
+    // 3. Минимальный размер (отсекаем мелочь)
+    if (w < 100 || hgt < 50) return false;
+
+    // 4. Проверка класса
     wchar_t cls[64] = {0};
     GetClassNameW(h, cls, 63);
-    if (wcscmp(cls, L"Shell_TrayWnd")==0 || wcscmp(cls, L"Progman")==0 || wcscmp(cls, L"WorkerW")==0) return false;
-    
+    if (wcscmp(cls, L"Shell_TrayWnd")==0 || 
+        wcscmp(cls, L"Progman")==0 || 
+        wcscmp(cls, L"WorkerW")==0 ||
+        wcscmp(cls, L"NotifyIconOverflowWindow")==0 || // Трей
+        wcscmp(cls, L"Microsoft::Windows::CUI::CICandidateWindow")==0) // Подсказки ввода
+        return false;
+
+    // 5. Проверка расширенных стилей
+    LONG exStyle = GetWindowLongW(h, GWL_EXSTYLE);
+    // Исключаем окна-инструменты (тултипы, плавающие панели) и окна без активации
+    if (exStyle & WS_EX_TOOLWINDOW) return false;
+    // if (exStyle & WS_EX_NOACTIVATE) return false; // Можно раскомментировать, если мешают фоновые процессы
+
+    // 6. Проверка обычного стиля
     LONG st = GetWindowLongW(h, GWL_STYLE);
-    if (!(st & WS_THICKFRAME) && !(st & WS_CAPTION) && !(st & WS_POPUP)) return false;
+    
+    // Окно должно иметь рамку, заголовок ИЛИ быть Popup-окном (как многие современные приложения)
+    bool hasFrame = (st & WS_THICKFRAME) || (st & WS_CAPTION);
+    bool isPopup = (st & WS_POPUP) != 0;
+    
+    if (!hasFrame && !isPopup) return false;
+
+    // 7. ПРОВЕРКА ЗАГОЛОВКА (Критично!)
+    // Многие внутренние окна (вкладки браузера, элементы UI) не имеют своего заголовка
+    wchar_t title[256] = {0};
+    GetWindowTextW(h, title, 255);
+    // Если заголовок пустой, скорее всего это не самостоятельное окно приложения
+    // Оставляем исключение для некоторых известных классов без заголовков, если нужно
+    if (wcslen(title) == 0) {
+        // Разрешаем только если это известный класс приложения без заголовка (опционально)
+        // Например, некоторые игровые лаунчеры или специфичный софт. 
+        // Пока строго отсекаем всё без текста.
+        return false; 
+    }
+
     return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ОТЛАДОЧНОЕ ОКНО
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Функция сбора данных и обновления текста
+void UpdateDebugWindow() {
+    std::wstringstream ss;
+    ss << L"=== DEBUG CONSOLE ===\n";
+    ss << L"Cam Offset: X=" << g_camOffset.x << L" Y=" << g_camOffset.y << L"\n";
+    ss << L"Animating: " << (g_isAnim.load() ? L"YES" : L"NO") << L"\n";
+    ss << L"Windows Count: " << g_snapshots.size() << L"\n";
+    ss << L"---------------------\n";
+
+    EnterCriticalSection(&g_lock);
+    int count = 0;
+    for (const auto& s : g_snapshots) {
+        if (!IsWindow(s.hwnd)) continue;
+        if (count >= 10) { ss << L"... (too many)\n"; break; }
+
+        RECT realRect;
+        GetWindowRect(s.hwnd, &realRect);
+        
+        int calcX = s.baseX + g_camOffset.x;
+        int calcY = s.baseY + g_camOffset.y;
+        int diffX = realRect.left - calcX;
+        int diffY = realRect.top - calcY;
+
+        ss << L"[" << count << L"] Diff: (" << diffX << L", " << diffY << L")\n";
+        ss << L"    Base: (" << s.baseX << L", " << s.baseY << L")\n";
+        ss << L"    Real: (" << realRect.left << L", " << realRect.top << L")\n";
+        count++;
+    }
+    LeaveCriticalSection(&g_lock);
+
+    // Безопасное обновление глобальной строки
+    EnterCriticalSection(&g_debugLock);
+    g_debugText = ss.str();
+    LeaveCriticalSection(&g_debugLock);
+
+    // Триггерим перерисовку окна отладки
+    if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
+}
+
+// Процедурка окна отладки
+LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE:
+            SetWindowTextW(hwnd, L"Debug Info");
+            return 0;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            
+            // Белый фон
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            HBRUSH hBrush = CreateSolidBrush(RGB(255, 255, 255));
+            FillRect(hdc, &rc, hBrush);
+            DeleteObject(hBrush);
+
+            // Черный текст
+            SetTextColor(hdc, RGB(0, 0, 0));
+            SetBkMode(hdc, TRANSPARENT);
+            
+            HFONT hFont = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                      DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+            HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
+
+            EnterCriticalSection(&g_debugLock);
+            std::wstring text = g_debugText;
+            LeaveCriticalSection(&g_debugLock);
+
+            // Рисуем текст с переносом строк
+            DrawTextW(hdc, text.c_str(), -1, &rc, DT_LEFT | DT_TOP | DT_WORDBREAK);
+
+            SelectObject(hdc, hOldFont);
+            DeleteObject(hFont);
+            
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void CreateDebugWindow(HINSTANCE hInst) {
+    WNDCLASSEXW wc = {sizeof(wc)};
+    wc.lpfnWndProc = DebugWndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"CanvasDebugClass";
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(WHITE_BRUSH);
+    
+    if (!RegisterClassExW(&wc)) return;
+
+    g_debugHwnd = CreateWindowExW(
+        0,
+        L"CanvasDebugClass",
+        L"Debug Info",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 400, 600,
+        NULL, NULL, hInst, NULL
+    );
+    if (g_debugHwnd) ShowWindow(g_debugHwnd, SW_SHOW);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -162,7 +323,7 @@ void ArrangeGrid() {
         cy += rH[r] + PAD;
     }
     ApplyMoves(ops);
-    g_camOffset = {0, 0}; // Сброс камеры в 0 после расстановки
+    g_camOffset = {0, 0};
 }
 
 void TakeSnapshot() {
@@ -177,7 +338,6 @@ void TakeSnapshot() {
         if (!IsValidWnd(h)) return TRUE;
         RECT r; GetWindowRect(h, &r);
         auto* c = (SnapshotCtx*)l;
-        // Сохраняем БАЗОВУЮ позицию: Физическая - СмещениеКамеры
         c->list->push_back({h, r.left - c->offset.x, r.top - c->offset.y, r.right-r.left, r.bottom-r.top});
         return TRUE;
     }, (LPARAM)&ctx);
@@ -203,7 +363,6 @@ void WorkerFunc() {
                 auto now = std::chrono::steady_clock::now();
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_animTime).count();
                 float t = std::min(1.0f, (float)ms / ANIM_DURATION);
-                // EaseOutCubic
                 float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t);
 
                 int curX = (int)(g_animStart.x + (g_animTarget.x - g_animStart.x) * ease);
@@ -216,7 +375,6 @@ void WorkerFunc() {
                     if (!IsWindow(s.hwnd)) continue;
                     int nx = s.baseX + curX;
                     int ny = s.baseY + curY;
-                    // Мягкие границы
                     nx = std::max(-5000, std::min(nx, CANVAS_WIDTH+5000));
                     ny = std::max(-5000, std::min(ny, CANVAS_HEIGHT+5000));
                     ops.push_back({s.hwnd, nx, ny, s.width, s.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
@@ -232,7 +390,7 @@ void WorkerFunc() {
 
                 g_camOffset.x += dx;
                 g_camOffset.y += dy;
-                g_dragStartMouse = cur; // Сброс дельты
+                g_dragStartMouse = cur;
 
                 for (auto& s : g_snapshots) {
                     if (!IsWindow(s.hwnd)) continue;
@@ -246,6 +404,13 @@ void WorkerFunc() {
             LeaveCriticalSection(&g_lock);
             if (!ops.empty()) ApplyMoves(ops);
         }
+
+        // Обновляем отладочное окно каждые ~10 кадров (чтобы не грузить CPU)
+        static int frameCount = 0;
+        if (++frameCount % 10 == 0) {
+            UpdateDebugWindow();
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(THREAD_SLEEP_MS));
     }
 }
@@ -254,12 +419,8 @@ void WorkerFunc() {
 // ЛОГИКА УПРАВЛЕНИЯ
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Функция запуска анимации к конкретному окну
 void SnapToWindow(HWND target) {
     EnterCriticalSection(&g_lock);
-    
-    // Обновляем снапшот прямо перед расчетом, чтобы базы были актуальны
-    // Но делаем это аккуратно, чтобы не потерять текущее состояние, если список пуст
     if (g_snapshots.empty()) {
         LeaveCriticalSection(&g_lock);
         TakeSnapshot();
@@ -270,7 +431,6 @@ void SnapToWindow(HWND target) {
     for (auto& s : g_snapshots) {
         if (s.hwnd == target) { found = &s; break; }
     }
-    // Поиск родителя если не нашли
     if (!found) {
         HWND root = GetAncestor(target, GA_ROOTOWNER);
         for (auto& s : g_snapshots) {
@@ -279,15 +439,11 @@ void SnapToWindow(HWND target) {
     }
 
     if (found) {
-        // Физический центр окна = База + ТекущаяКамера + ПоловинаРазмера
         int winCx = found->baseX + g_camOffset.x + found->width / 2;
         int winCy = found->baseY + g_camOffset.y + found->height / 2;
-
         int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
         int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
 
-        // Целевая камера должна быть такой, чтобы центр окна совпал с центром экрана
-        // TargetOffset = ScreenCenter - (Base + Size/2)
         int targetOffX = screenCx - (found->baseX + found->width / 2);
         int targetOffY = screenCy - (found->baseY + found->height / 2);
 
@@ -301,11 +457,11 @@ void SnapToWindow(HWND target) {
 }
 
 void StartDrag(POINT p) {
-    g_isAnim.store(false); // Стоп анимация
+    g_isAnim.store(false);
     g_isDragging.store(true);
     g_dragStartMouse = p;
     g_currentMouse = p;
-    TakeSnapshot(); // Фиксируем базы относительно текущей камеры
+    TakeSnapshot();
 }
 
 void Zoom(float scale) {
@@ -321,25 +477,17 @@ void Zoom(float scale) {
     std::vector<WindowMoveOp> ops;
     for (auto& s : g_snapshots) {
         if (!IsWindow(s.hwnd)) continue;
-        
         int physX = s.baseX + g_camOffset.x;
         int physY = s.baseY + g_camOffset.y;
-        
         int cx = physX + s.width/2;
         int cy = physY + s.height/2;
-        
         int ncx = center.x + (int)((cx - center.x) * scale);
         int ncy = center.y + (int)((cy - center.y) * scale);
-        
         int nw = std::max(100, (int)(s.width * scale));
         int nh = std::max(100, (int)(s.height * scale));
-        
         int nx = ncx - nw/2;
         int ny = ncy - nh/2;
-        
         ops.push_back({s.hwnd, nx, ny, nw, nh, SWP_NOZORDER|SWP_NOACTIVATE});
-        
-        // Обновляем базу: НоваяФизическая - ТекущаяКамера
         s.baseX = nx - g_camOffset.x;
         s.baseY = ny - g_camOffset.y;
         s.width = nw;
@@ -367,14 +515,12 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
     g_currentMouse.y = m->pt.y;
     
     if (wParam == WM_LBUTTONDOWN) {
-        // ЛКМ: Полет к окну
         HWND h = WindowFromPoint(m->pt);
         if (h) SnapToWindow(GetAncestor(h, GA_ROOTOWNER));
         return 1;
     }
     
     if (wParam == WM_MBUTTONDOWN) {
-        // СКМ: Драг
         StartDrag(m->pt);
         return 1;
     }
@@ -399,39 +545,54 @@ LRESULT CALLBACK KbHook(int nCode, WPARAM wParam, LPARAM lParam) {
     
     if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
         KBDLLHOOKSTRUCT* k = (KBDLLHOOKSTRUCT*)lParam;
-        if (k->vkCode == VK_NUMPAD5) {
-            if ((GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0) {
-                EnterCriticalSection(&g_lock);
-                if (g_snapshots.empty()) {
-                    LeaveCriticalSection(&g_lock);
-                    TakeSnapshot();
-                    EnterCriticalSection(&g_lock);
-                }
+        
+        if (k->vkCode == VK_NUMPAD5 && (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0) {
+            int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
+            int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
 
-                int bestDist = INT_MAX;
-                WindowSnapshot* best = nullptr;
-                int scX = GetSystemMetrics(SM_CXSCREEN)/2;
-                int scY = GetSystemMetrics(SM_CYSCREEN)/2;
+            long long minDistSq = -1;
+            HWND bestHwnd = NULL;
+            RECT bestRect = {0};
 
-                for (auto& s : g_snapshots) {
+            EnterCriticalSection(&g_lock);
+            if (!g_snapshots.empty()) {
+                for (const auto& s : g_snapshots) {
                     if (!IsWindow(s.hwnd)) continue;
-                    int cx = s.baseX + g_camOffset.x + s.width/2;
-                    int cy = s.baseY + g_camOffset.y + s.height/2;
-                    int d = (cx-scX)*(cx-scX) + (cy-scY)*(cy-scY);
-                    if (d < bestDist) { bestDist = d; best = &s; }
-                }
+                    RECT realRect;
+                    if (!GetWindowRect(s.hwnd, &realRect)) continue;
 
-                if (best) {
-                    int targetOffX = scX - (best->baseX + best->width/2);
-                    int targetOffY = scY - (best->baseY + best->height/2);
-                    
-                    g_animStart = g_camOffset;
-                    g_animTarget.x = targetOffX;
-                    g_animTarget.y = targetOffY;
-                    g_animTime = std::chrono::steady_clock::now();
-                    g_isAnim.store(true);
+                    int winCx = realRect.left + (realRect.right - realRect.left) / 2;
+                    int winCy = realRect.top + (realRect.bottom - realRect.top) / 2;
+
+                    long long dx = winCx - screenCx;
+                    long long dy = winCy - screenCy;
+                    long long distSq = dx * dx + dy * dy;
+
+                    if (minDistSq == -1 || distSq < minDistSq) {
+                        minDistSq = distSq;
+                        bestHwnd = s.hwnd;
+                        bestRect = realRect;
+                    }
                 }
-                LeaveCriticalSection(&g_lock);
+            }
+            LeaveCriticalSection(&g_lock);
+
+            if (bestHwnd) {
+                int winW = bestRect.right - bestRect.left;
+                int winH = bestRect.bottom - bestRect.top;
+                int realCenterX = bestRect.left + winW / 2;
+                int realCenterY = bestRect.top + winH / 2;
+
+                int deltaX = screenCx - realCenterX;
+                int deltaY = screenCy - realCenterY;
+
+                g_animStart = g_camOffset;
+                g_animTarget.x = g_camOffset.x + deltaX;
+                g_animTarget.y = g_camOffset.y + deltaY;
+                
+                g_animTime = std::chrono::steady_clock::now();
+                g_isAnim.store(true);
+                
                 return 1;
             }
         }
@@ -445,6 +606,8 @@ LRESULT CALLBACK KbHook(int nCode, WPARAM wParam, LPARAM lParam) {
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CREATE) {
         InitializeCriticalSection(&g_lock);
+        InitializeCriticalSection(&g_debugLock);
+        
         g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, NULL, 0);
         g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbHook, NULL, 0);
         
@@ -466,6 +629,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         UnhookWindowsHookEx(g_mouseHook);
         UnhookWindowsHookEx(g_kbHook);
         DeleteCriticalSection(&g_lock);
+        DeleteCriticalSection(&g_debugLock);
         PostQuitMessage(0);
         return 0;
     }
@@ -475,18 +639,22 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int) {
     if (!IsAdmin()) RunAsAdmin();
     
-    WNDCLASSEXW wc = {sizeof(wc)};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = h;
-    wc.lpszClassName = L"CanvasDesk";
-    RegisterClassExW(&wc);
+    // 1. Регистрируем класс основного окна
+    WNDCLASSEXW wcMain = {sizeof(wcMain)};
+    wcMain.lpfnWndProc = WndProc;
+    wcMain.hInstance = h;
+    wcMain.lpszClassName = L"CanvasDesk";
+    RegisterClassExW(&wcMain);
     
+    // 2. Создаем основное прозрачное окно
     g_hwnd = CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
                              L"CanvasDesk", L"", WS_POPUP, 0,0,1,1, NULL,NULL,h,NULL);
     if (!g_hwnd) return 1;
-    
     SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
     ShowWindow(g_hwnd, SW_SHOW);
+
+    // 3. Создаем окно отладки
+    CreateDebugWindow(h);
     
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
