@@ -51,8 +51,8 @@ std::atomic<bool> g_stop(false);
 
 HHOOK g_mouseHook = NULL;
 HHOOK g_kbHook = NULL;
-HWND g_hwnd = NULL;       // Основное прозрачное окно
-HWND g_debugHwnd = NULL;  // Окно отладки
+HWND g_hwnd = NULL;       // Основное прозрачное окно (невидимое)
+HWND g_debugHwnd = NULL;  // Окно отладки (видимое, часть матрицы)
 
 // Система камеры
 POINT g_camOffset = {0, 0};
@@ -97,12 +97,13 @@ void RunAsAdmin() {
 }
 
 bool IsValidWnd(HWND h) {
+    // 1. Игнорируем только основное невидимое окно-контейнер
     if (!h || h == g_hwnd) return false;
     
-    // 1. Проверка видимости
+    // 2. Проверка видимости (для отладки можно показывать даже скрытые, но пока строго)
     if (!IsWindowVisible(h)) return false;
 
-    // 2. Проверка на весь экран (исключаем игры и видео на весь экран)
+    // 3. Проверка на весь экран
     RECT r; 
     GetWindowRect(h, &r);
     int w = r.right - r.left;
@@ -111,44 +112,36 @@ bool IsValidWnd(HWND h) {
     if (w >= GetSystemMetrics(SM_CXSCREEN) && hgt >= GetSystemMetrics(SM_CYSCREEN)) 
         return false;
 
-    // 3. Минимальный размер (отсекаем мелочь)
+    // 4. Минимальный размер (отсекаем мелочь, но дебаг окно обычно большое)
     if (w < 100 || hgt < 50) return false;
 
-    // 4. Проверка класса
+    // 5. Проверка класса (исключаем системный мусор)
     wchar_t cls[64] = {0};
     GetClassNameW(h, cls, 63);
     if (wcscmp(cls, L"Shell_TrayWnd")==0 || 
         wcscmp(cls, L"Progman")==0 || 
         wcscmp(cls, L"WorkerW")==0 ||
-        wcscmp(cls, L"NotifyIconOverflowWindow")==0 || // Трей
-        wcscmp(cls, L"Microsoft::Windows::CUI::CICandidateWindow")==0) // Подсказки ввода
+        wcscmp(cls, L"NotifyIconOverflowWindow")==0 ||
+        wcscmp(cls, L"Microsoft::Windows::CUI::CICandidateWindow")==0)
         return false;
 
-    // 5. Проверка расширенных стилей
+    // 6. Проверка расширенных стилей (исключаем тултипы)
     LONG exStyle = GetWindowLongW(h, GWL_EXSTYLE);
-    // Исключаем окна-инструменты (тултипы, плавающие панели) и окна без активации
     if (exStyle & WS_EX_TOOLWINDOW) return false;
-    // if (exStyle & WS_EX_NOACTIVATE) return false; // Можно раскомментировать, если мешают фоновые процессы
 
-    // 6. Проверка обычного стиля
+    // 7. Проверка обычного стиля
     LONG st = GetWindowLongW(h, GWL_STYLE);
-    
-    // Окно должно иметь рамку, заголовок ИЛИ быть Popup-окном (как многие современные приложения)
     bool hasFrame = (st & WS_THICKFRAME) || (st & WS_CAPTION);
     bool isPopup = (st & WS_POPUP) != 0;
     
     if (!hasFrame && !isPopup) return false;
 
-    // 7. ПРОВЕРКА ЗАГОЛОВКА (Критично!)
-    // Многие внутренние окна (вкладки браузера, элементы UI) не имеют своего заголовка
+    // 8. ПРОВЕРКА ЗАГОЛОВКА
+    // Окно отладки имеет заголовок "Debug Info", поэтому оно пройдет эту проверку
     wchar_t title[256] = {0};
     GetWindowTextW(h, title, 255);
-    // Если заголовок пустой, скорее всего это не самостоятельное окно приложения
-    // Оставляем исключение для некоторых известных классов без заголовков, если нужно
+    
     if (wcslen(title) == 0) {
-        // Разрешаем только если это известный класс приложения без заголовка (опционально)
-        // Например, некоторые игровые лаунчеры или специфичный софт. 
-        // Пока строго отсекаем всё без текста.
         return false; 
     }
 
@@ -159,7 +152,6 @@ bool IsValidWnd(HWND h) {
 // ОТЛАДОЧНОЕ ОКНО
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Функция сбора данных и обновления текста
 void UpdateDebugWindow() {
     std::wstringstream ss;
     ss << L"=== DEBUG CONSOLE ===\n";
@@ -189,16 +181,13 @@ void UpdateDebugWindow() {
     }
     LeaveCriticalSection(&g_lock);
 
-    // Безопасное обновление глобальной строки
     EnterCriticalSection(&g_debugLock);
     g_debugText = ss.str();
     LeaveCriticalSection(&g_debugLock);
 
-    // Триггерим перерисовку окна отладки
     if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
 }
 
-// Процедурка окна отладки
 LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
@@ -208,14 +197,12 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
             
-            // Белый фон
             RECT rc;
             GetClientRect(hwnd, &rc);
             HBRUSH hBrush = CreateSolidBrush(RGB(255, 255, 255));
             FillRect(hdc, &rc, hBrush);
             DeleteObject(hBrush);
 
-            // Черный текст
             SetTextColor(hdc, RGB(0, 0, 0));
             SetBkMode(hdc, TRANSPARENT);
             
@@ -228,7 +215,6 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             std::wstring text = g_debugText;
             LeaveCriticalSection(&g_debugLock);
 
-            // Рисуем текст с переносом строк
             DrawTextW(hdc, text.c_str(), -1, &rc, DT_LEFT | DT_TOP | DT_WORDBREAK);
 
             SelectObject(hdc, hOldFont);
@@ -238,6 +224,7 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         }
         case WM_DESTROY:
+            g_debugHwnd = NULL; // Сбрасываем хендл
             PostQuitMessage(0);
             return 0;
     }
@@ -254,11 +241,12 @@ void CreateDebugWindow(HINSTANCE hInst) {
     
     if (!RegisterClassExW(&wc)) return;
 
+    // Создаем обычное окно с заголовком и рамкой, чтобы оно попало в матрицу
     g_debugHwnd = CreateWindowExW(
-        0,
+        0, 
         L"CanvasDebugClass",
         L"Debug Info",
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW, // Рамка, заголовок, кнопки
         CW_USEDEFAULT, CW_USEDEFAULT, 400, 600,
         NULL, NULL, hInst, NULL
     );
@@ -405,7 +393,6 @@ void WorkerFunc() {
             if (!ops.empty()) ApplyMoves(ops);
         }
 
-        // Обновляем отладочное окно каждые ~10 кадров (чтобы не грузить CPU)
         static int frameCount = 0;
         if (++frameCount % 10 == 0) {
             UpdateDebugWindow();
@@ -620,7 +607,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_worker = std::thread(WorkerFunc);
         
         Sleep(300);
-        ArrangeGrid();
+        // ArrangeGrid вызовется после создания дебаг окна в WinMain
         return 0;
     }
     if (m == WM_DESTROY) {
@@ -639,23 +626,42 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int) {
     if (!IsAdmin()) RunAsAdmin();
     
-    // 1. Регистрируем класс основного окна
     WNDCLASSEXW wcMain = {sizeof(wcMain)};
     wcMain.lpfnWndProc = WndProc;
     wcMain.hInstance = h;
     wcMain.lpszClassName = L"CanvasDesk";
     RegisterClassExW(&wcMain);
     
-    // 2. Создаем основное прозрачное окно
     g_hwnd = CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
                              L"CanvasDesk", L"", WS_POPUP, 0,0,1,1, NULL,NULL,h,NULL);
     if (!g_hwnd) return 1;
     SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
     ShowWindow(g_hwnd, SW_SHOW);
 
-    // 3. Создаем окно отладки
+    // 1. Сначала создаем окно отладки
     CreateDebugWindow(h);
     
+    // Небольшая пауза, чтобы окно точно создалось и стало видимым
+    Sleep(100);
+
+    // 2. Теперь запускаем цикл сообщений основного окна, внутри которого при WM_CREATE
+    // вызывается ArrangeGrid(). Так как дебаг окно уже создано и видимо, 
+    // IsValidWnd пропустит его, и оно попадет в матрицу.
+    
+    // Примечание: ArrangeGrid вызывается в WndProc при WM_CREATE. 
+    // Чтобы гарантировать порядок, можно вызвать ArrangeGrid явно здесь после создания дебага,
+    // но так как g_worker еще не запущен (ждет WM_CREATE), лучше оставить логику там.
+    // Однако, чтобы быть уверенным, что ArrangeGrid увидит новое окно, 
+    // мы можем просто подождать немного перед стартом цикла сообщений, 
+    // но WM_CREATE уже отработал при создании g_hwnd.
+    
+    // Исправление порядка:
+    // g_hwnd создан -> WM_CREATE отработал (хуки установлены, поток запущен).
+    // Но ArrangeGrid вызван ДО CreateDebugWindow в предыдущей версии.
+    // Теперь нам нужно вызвать ArrangeGrid ЕЩЕ РАЗ вручную после создания дебаг окна.
+    
+    ArrangeGrid(); // Принудительная перерасстановка с учетом нового окна
+
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
