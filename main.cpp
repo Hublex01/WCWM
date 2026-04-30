@@ -36,6 +36,13 @@ POINT g_dragStartMouse = {0, 0};        // Позиция мыши в момен
 POINT g_currentMouse = {0, 0};          // Текущая позиция мыши (обновляется в хуке)
 std::vector<WindowSnapshot> g_windowSnapshots;
 
+// Логическое смещение для центрирования при первом drag
+int g_virtualCanvasX = 0;
+int g_virtualCanvasY = 0;
+
+// Флаг для отслеживания первой инициализации
+bool g_initialLayoutDone = false;
+
 // Синхронизация для доступа к списку окон
 CRITICAL_SECTION g_snapshotLock;
 
@@ -127,10 +134,111 @@ bool ShouldProcessWindow(HWND hwnd) {
 // SNAPSHOT СИСТЕМА
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Forward declaration
+void ApplyWindowMoves(const std::vector<WindowMoveOperation>& operations);
+
+// Расстановка окон в сетку 3 колонки
+void ArrangeWindowsInGrid() {
+    std::vector<WindowSnapshot> windows;
+    
+    // Собираем все окна
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        if (!ShouldProcessWindow(hwnd)) return TRUE;
+        
+        RECT rect;
+        GetWindowRect(hwnd, &rect);
+        
+        auto* windows = reinterpret_cast<std::vector<WindowSnapshot>*>(lParam);
+        windows->push_back({
+            hwnd,
+            rect.left, rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top
+        });
+        
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&windows));
+    
+    if (windows.empty()) return;
+    
+    const int COLUMNS = 3;
+    const int PADDING = 5;
+    
+    // Вычисляем количество рядов
+    int totalWindows = static_cast<int>(windows.size());
+    int rows = (totalWindows + COLUMNS - 1) / COLUMNS;
+    
+    // Вычисляем максимальную ширину и высоту для каждой колонки/ряда
+    std::vector<int> colMaxWidth(COLUMNS, 0);
+    std::vector<int> rowMaxHeight(rows, 0);
+    
+    for (int i = 0; i < totalWindows; ++i) {
+        int col = i % COLUMNS;
+        int row = i / COLUMNS;
+        
+        colMaxWidth[col] = (windows[i].width > colMaxWidth[col]) ? windows[i].width : colMaxWidth[col];
+        rowMaxHeight[row] = (windows[i].height > rowMaxHeight[row]) ? windows[i].height : rowMaxHeight[row];
+    }
+    
+    // Вычисляем общую ширину и высоту сетки
+    int gridWidth = 0;
+    for (int w : colMaxWidth) gridWidth += w;
+    gridWidth += (COLUMNS - 1) * PADDING;
+    
+    int gridHeight = 0;
+    for (int h : rowMaxHeight) gridHeight += h;
+    gridHeight += (rows - 1) * PADDING;
+    
+    // Вычисляем начальную позицию для центрирования
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    int startX = (screenWidth - gridWidth) / 2;
+    int startY = (screenHeight - gridHeight) / 2;
+    
+    // Ограничиваем, чтобы сетка не выходила за границы холста
+    startX = (startX < 0) ? 0 : startX;
+    startY = (startY < 0) ? 0 : startY;
+    
+    // Вычисляем новые позиции
+    std::vector<WindowMoveOperation> moves;
+    moves.reserve(totalWindows);
+    
+    int currentY = startY;
+    for (int row = 0; row < rows; ++row) {
+        int currentX = startX;
+        for (int col = 0; col < COLUMNS; ++col) {
+            int idx = row * COLUMNS + col;
+            if (idx >= totalWindows) break;
+            
+            moves.push_back({
+                windows[idx].hwnd,
+                currentX, currentY,
+                windows[idx].width, windows[idx].height,
+                SWP_NOZORDER | SWP_NOACTIVATE
+            });
+            
+            currentX += colMaxWidth[col] + PADDING;
+        }
+        currentY += rowMaxHeight[row] + PADDING;
+    }
+    
+    // Применяем перемещения
+    if (!moves.empty()) {
+        ApplyWindowMoves(moves);
+    }
+}
+
 void TakeWindowSnapshot() {
     EnterCriticalSection(&g_snapshotLock);
     g_windowSnapshots.clear();
     
+    // Инициализируем виртуальный центр только один раз при первом snapshot
+    if (g_virtualCanvasX == 0 && g_virtualCanvasY == 0) {
+        g_virtualCanvasX = CANVAS_WIDTH / 2;  // 2500
+        g_virtualCanvasY = CANVAS_HEIGHT / 2; // 2500
+    }
+    
+    // Сохраняем исключительно физические координаты
     EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
         if (!ShouldProcessWindow(hwnd)) return TRUE;
         
@@ -200,10 +308,11 @@ void WorkerThreadFunc() {
             for (const auto& snapshot : g_windowSnapshots) {
                 if (!IsWindow(snapshot.hwnd)) continue;
                 
+                // Простое перемещение: snapshot + delta
                 int newX = snapshot.snapshotX + deltaX;
                 int newY = snapshot.snapshotY + deltaY;
                 
-                // Границы холста
+                // Границы холста (центр в CANVAS_WIDTH/2, CANVAS_HEIGHT/2)
                 newX = std::max(-(snapshot.width / 2), 
                        std::min(newX, CANVAS_WIDTH - snapshot.width / 2));
                 newY = std::max(-(snapshot.height / 2), 
@@ -244,8 +353,11 @@ void StopWorkerThread() {
 
 void StartCanvasDrag(POINT mousePosition) {
     g_isDragging.store(true);
+    
+    // Не добавляем offset - он применяется в worker thread
     g_dragStartMouse = mousePosition;
     g_currentMouse = mousePosition;
+    
     TakeWindowSnapshot();
 }
 
@@ -286,12 +398,13 @@ void ScaleCanvas(float scaleFactor, POINT scaleCenter) {
             SWP_NOZORDER | SWP_NOACTIVATE
         });
 
-        // Обновляем снапшот "на лету" для зума
+        // Обновляем снапшот к новым физическим координатам
         snapshot.snapshotX = newX;
         snapshot.snapshotY = newY;
         snapshot.width = newWidth;
         snapshot.height = newHeight;
     }
+    
     LeaveCriticalSection(&g_snapshotLock);
 
     ApplyWindowMoves(moves);
@@ -342,8 +455,8 @@ LRESULT CALLBACK GlobalMouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
                               GetSystemMetrics(SM_CYSCREEN) / 2 };
         ScaleCanvas(scaleFactor, scaleCenter);
         
-        // При зуме сбрасываем точку отсчета драга, чтобы не было рывка
-        g_dragStartMouse = mouseData->pt; 
+        // Обновляем точку отсчета драга после зума (без offset - snapshot уже содержит истинные координаты)
+        g_dragStartMouse = mouseData->pt;
 
         return 1; // Зум лучше блокировать, чтобы не скроллились окна под курсором
     }
@@ -439,4 +552,4 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
     
     return static_cast<int>(message.wParam);
-}
+}   
