@@ -18,7 +18,7 @@ const int CANVAS_HEIGHT = 10000;
 WPARAM g_activateKey = VK_RCONTROL;
 WPARAM g_panKey = 0;
 
-const int THREAD_SLEEP_MS = 8; 
+const int THREAD_SLEEP_MS = 4; 
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // СТРУКТУРЫ
@@ -311,6 +311,7 @@ void ApplyMoves(const std::vector<WindowMoveOp>& ops) {
 void ArrangeGrid() {
     // Эта функция вызывается редко (старт, дабл-тап), здесь EnumWindows допустим
     std::vector<WindowSnapshot> list;
+    list.reserve(64); // Предварительное выделение памяти
     EnumWindows([](HWND h, LPARAM l) -> BOOL {
         if (!IsValidWnd(h)) return TRUE;
         RECT r; GetWindowRect(h, &r);
@@ -332,6 +333,7 @@ void ArrangeGrid() {
     gW += (COLS-1)*PAD; gH += (rows-1)*PAD;
     int startX = 0, startY = 0;
     std::vector<WindowMoveOp> ops;
+    ops.reserve(list.size()); // Предварительное выделение для операций
     int cy = startY;
     for (int r=0; r<rows; ++r) {
         int cx = startX;
@@ -354,6 +356,7 @@ void TakeSnapshot() {
     // Вызывается ТОЛЬКО при старте или после ArrangeGrid
     EnterCriticalSection(&g_lock);
     g_snapshots.clear();
+    g_snapshots.reserve(64); // Предварительное выделение памяти
     SnapshotCtx ctx{&g_snapshots, g_camOffset};
     EnumWindows([](HWND h, LPARAM l) -> BOOL {
         if (!IsValidWnd(h)) return TRUE;
@@ -412,7 +415,7 @@ void WorkerFunc() {
 
         // Обновление отладки теперь быстрое, так как внутри нет EnumWindows
         static int frameCount = 0;
-        if (++frameCount % 15 == 0) UpdateDebugWindow(); // Чуть реже обновляем текст
+        if (++frameCount % 8 == 0) UpdateDebugWindow(); // Оптимизировано для плавности
         
         std::this_thread::sleep_for(std::chrono::milliseconds(THREAD_SLEEP_MS));
     }
@@ -455,6 +458,7 @@ void Zoom(float scale) {
     POINT center = {GetSystemMetrics(SM_CXSCREEN)/2, GetSystemMetrics(SM_CYSCREEN)/2};
     if (g_snapshots.empty()) { LeaveCriticalSection(&g_lock); return; }
     std::vector<WindowMoveOp> ops;
+    ops.reserve(g_snapshots.size()); // Предварительное выделение памяти
     for (auto& s : g_snapshots) {
         if (!IsWindow(s.hwnd)) continue;
         int physX = s.baseX + g_camOffset.x;
