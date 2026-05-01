@@ -8,7 +8,9 @@
 #include <sstream>
 #include <string>
 #include <iomanip>
-
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 // ═══════════════════════════════════════════════════════════════════════════════
 // КОНФИГУРАЦИЯ
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -19,6 +21,7 @@ WPARAM g_activateKey = VK_RCONTROL;
 WPARAM g_panKey = 0;
 
 const int THREAD_SLEEP_MS = 4; 
+const int GRID_ANIM_DURATION = 600; // Длительность анимации сетки (мс)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // СТРУКТУРЫ
@@ -40,6 +43,30 @@ struct SnapshotCtx {
     POINT offset;
 };
 
+// Элемент анимации сетки
+struct GridAnimItem {
+    HWND hwnd;
+    int startX, startY;
+    int endX, endY;
+    int width, height;
+};
+
+// Состояние анимации сетки
+struct GridAnimState {
+    bool active = false;
+    std::vector<GridAnimItem> items;
+    std::chrono::steady_clock::time_point startTime;
+    int durationMs = GRID_ANIM_DURATION;
+};
+
+// Вспомогательная структура для сортировки окон
+struct SortedWindow {
+    HWND hwnd;
+    int w, h;
+    long long area;
+    int curX, curY; // Текущие координаты (для старта анимации)
+};
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -59,11 +86,15 @@ HWND g_debugHwnd = NULL;
 
 POINT g_camOffset = {0, 0};
 
-std::atomic<bool> g_isAnim(false);
-POINT g_animStart = {0, 0};
-POINT g_animTarget = {0, 0};
-std::chrono::steady_clock::time_point g_animTime;
-const int ANIM_DURATION = 400;
+// Анимация камеры (зум/пан к окну)
+std::atomic<bool> g_isCamAnim(false);
+POINT g_camAnimStart = {0, 0};
+POINT g_camAnimTarget = {0, 0};
+std::chrono::steady_clock::time_point g_camAnimTime;
+const int CAM_ANIM_DURATION = 400;
+
+// Анимация сетки
+GridAnimState g_gridAnim;
 
 std::wstring g_debugText = L"";
 CRITICAL_SECTION g_debugLock;
@@ -192,13 +223,13 @@ void HandleDoubleTapReset() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ОТЛАДОЧНОЕ ОКНО (ОПТИМИЗИРОВАНО)
+// ОТЛАДОЧНОЕ ОКНО
 // ═══════════════════════════════════════════════════════════════════════════════
 void UpdateDebugWindow() {
     std::wstringstream ss;
     ss << L"=== WCWM DEBUG ===\n";
     ss << L"Camera: " << g_camOffset.x << L", " << g_camOffset.y << L"\n";
-    // Берем размер из глобального вектора без перечисления!
+    ss << L"Grid Anim: " << (g_gridAnim.active ? L"RUNNING" : L"IDLE") << L"\n";
     ss << L"Windows Cached: " << g_snapshots.size() << L"\n";
     ss << L"Activate: " << GetKeyNameStr(g_activateKey) << L"\n";
     ss << L"Pan: " << GetKeyNameStr(g_panKey) << L"\n";
@@ -208,14 +239,12 @@ void UpdateDebugWindow() {
     }
     ss << L"---------------------\n";
 
-    // Блокируем доступ к списку только для чтения данных, без EnumWindows!
     EnterCriticalSection(&g_lock);
     int count = 0;
     for (const auto& s : g_snapshots) {
-        if (!IsWindow(s.hwnd)) continue; // Просто проверяем, живо ли окно
+        if (!IsWindow(s.hwnd)) continue;
         if (count >= 15) { ss << L"... (and more)\n"; break; }
         
-        // Получаем заголовок только для отображения
         wchar_t title[256] = {0};
         GetWindowTextW(s.hwnd, title, 255);
         if (wcslen(title) == 0) wcscpy_s(title, 256, L"<No Title>");
@@ -309,9 +338,8 @@ void ApplyMoves(const std::vector<WindowMoveOp>& ops) {
 }
 
 void ArrangeGrid() {
-    // Эта функция вызывается редко (старт, дабл-тап), здесь EnumWindows допустим
     std::vector<WindowSnapshot> list;
-    list.reserve(64); // Предварительное выделение памяти
+    list.reserve(64);
     EnumWindows([](HWND h, LPARAM l) -> BOOL {
         if (!IsValidWnd(h)) return TRUE;
         RECT r; GetWindowRect(h, &r);
@@ -321,42 +349,113 @@ void ArrangeGrid() {
     }, (LPARAM)&list);
 
     if (list.empty()) return;
-    const int COLS = 3, PAD = 10;
-    int rows = (list.size() + COLS - 1) / COLS;
-    std::vector<int> cW(COLS, 0), rH(rows, 0);
-    for (size_t i=0; i<list.size(); ++i) {
-        cW[i%COLS] = std::max(cW[i%COLS], list[i].width);
-        rH[i/COLS] = std::max(rH[i/COLS], list[i].height);
-    }
-    int gW = 0, gH = 0;
-    for(int x:cW) gW+=x; for(int y:rH) gH+=y;
-    gW += (COLS-1)*PAD; gH += (rows-1)*PAD;
-    int startX = 0, startY = 0;
-    std::vector<WindowMoveOp> ops;
-    ops.reserve(list.size()); // Предварительное выделение для операций
-    int cy = startY;
-    for (int r=0; r<rows; ++r) {
-        int cx = startX;
-        for (int c=0; c<COLS; ++c) {
-            int idx = r*COLS+c;
-            if (idx >= (int)list.size()) break;
-            ops.push_back({list[idx].hwnd, cx, cy, list[idx].width, list[idx].height, SWP_NOZORDER|SWP_NOACTIVATE});
-            cx += cW[c] + PAD;
-        }
-        cy += rH[r] + PAD;
-    }
-    ApplyMoves(ops);
-    g_camOffset = {0, 0};
+
+    // 1. Сортировка по площади (от большого к маленькому)
+    std::sort(list.begin(), list.end(), [](const WindowSnapshot& a, const WindowSnapshot& b) {
+        return (a.width * a.height) > (b.width * b.height);
+    });
+
+    // Структура для хранения занятых областей (чтобы не накладывались)
+    struct PlacedRect {
+        int x, y, w, h;
+    };
+    std::vector<PlacedRect> placed;
     
-    // Обновляем снапшот после перестройки
-    TakeSnapshot();
+    // Подготовка данных для анимации
+    EnterCriticalSection(&g_lock);
+    g_gridAnim.items.clear();
+    g_gridAnim.items.reserve(list.size());
+
+    // 2. Размещение первого (самого большого) в центре (0,0)
+    int centerX = 0;
+    int centerY = 0;
+    
+    // Вспомогательная функция проверки пересечений
+    auto intersects = [&](int nx, int ny, int nw, int nh) {
+        for (const auto& pr : placed) {
+            // Проверка пересечения прямоугольников
+            if (!(nx + nw <= pr.x || nx >= pr.x + pr.w || ny + nh <= pr.y || ny >= pr.y + pr.h)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Функция поиска позиции для окна (спиральная упаковка)
+    auto findPosition = [&](int w, int h) -> POINT {
+        if (placed.empty()) {
+            return {centerX - w/2, centerY - h/2}; // Центр экрана
+        }
+
+        // Начинаем поиск с центра и двигаемся по спирали
+        // Для упрощения и скорости будем искать позицию, приставляя новое окно 
+        // к одной из сторон уже размещенных окон.
+        
+        int bestX = 0, bestY = 0;
+        long long minDistSq = -1;
+
+        // Пробуем приставить к каждому уже размещенному окну со всех 4 сторон
+        for (const auto& pr : placed) {
+            // Кандидаты: Справа, Слева, Снизу, Сверху
+            int candidates[4][2] = {
+                {pr.x + pr.w, pr.y},             // Right
+                {pr.x - w, pr.y},                // Left
+                {pr.x, pr.y + pr.h},             // Bottom
+                {pr.x, pr.y - h}                 // Top
+            };
+
+            for (int i = 0; i < 4; ++i) {
+                int cx = candidates[i][0];
+                int cy = candidates[i][1];
+
+                // Проверяем, не пересекается ли эта позиция с другими
+                if (!intersects(cx, cy, w, h)) {
+                    // Вычисляем расстояние до центра (чтобы фигура была круглой/компактной)
+                    int dx = (cx + w/2) - centerX;
+                    int dy = (cy + h/2) - centerY;
+                    long long distSq = 1LL*dx*dx + 1LL*dy*dy;
+
+                    if (minDistSq == -1 || distSq < minDistSq) {
+                        minDistSq = distSq;
+                        bestX = cx;
+                        bestY = cy;
+                    }
+                }
+            }
+        }
+        return {bestX, bestY};
+    };
+
+    // 3. Цикл размещения
+    for (const auto& win : list) {
+        POINT pos = findPosition(win.width, win.height);
+        
+        // Добавляем в список занятых
+        placed.push_back({pos.x, pos.y, win.width, win.height});
+
+        // Добавляем в анимацию
+        GridAnimItem item;
+        item.hwnd = win.hwnd;
+        item.startX = win.baseX; // Текущая позиция
+        item.startY = win.baseY;
+        item.endX = pos.x;       // Новая позиция (плитка)
+        item.endY = pos.y;
+        item.width = win.width;
+        item.height = win.height;
+        
+        g_gridAnim.items.push_back(item);
+    }
+
+    g_gridAnim.startTime = std::chrono::steady_clock::now();
+    g_gridAnim.active = true;
+    g_camOffset = {0, 0};
+    LeaveCriticalSection(&g_lock);
 }
 
 void TakeSnapshot() {
-    // Вызывается ТОЛЬКО при старте или после ArrangeGrid
     EnterCriticalSection(&g_lock);
     g_snapshots.clear();
-    g_snapshots.reserve(64); // Предварительное выделение памяти
+    g_snapshots.reserve(64);
     SnapshotCtx ctx{&g_snapshots, g_camOffset};
     EnumWindows([](HWND h, LPARAM l) -> BOOL {
         if (!IsValidWnd(h)) return TRUE;
@@ -369,29 +468,61 @@ void TakeSnapshot() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ПОТОК (ОПТИМИЗИРОВАН)
+// ПОТОК
 // ═══════════════════════════════════════════════════════════════════════════════
 void WorkerFunc() {
     while (!g_stop.load()) {
         bool drag = g_isDragging.load();
-        bool anim = g_isAnim.load();
+        bool camAnim = g_isCamAnim.load();
+        bool gridAnim = g_gridAnim.active;
         
-        if (drag || anim) {
-            std::vector<WindowMoveOp> ops;
-            EnterCriticalSection(&g_lock);
+        std::vector<WindowMoveOp> ops;
+        
+        EnterCriticalSection(&g_lock);
+        
+        if (gridAnim) {
+            auto now = std::chrono::steady_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_gridAnim.startTime).count();
+            float t = std::min(1.0f, (float)ms / g_gridAnim.durationMs);
+            float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t); 
+            
+            ops.reserve(g_gridAnim.items.size());
+            
+            for (const auto& item : g_gridAnim.items) {
+                if (!IsWindow(item.hwnd)) continue;
+                
+                int curX = (int)(item.startX + (item.endX - item.startX) * ease);
+                int curY = (int)(item.startY + (item.endY - item.startY) * ease);
+                
+                ops.push_back({item.hwnd, curX, curY, item.width, item.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
+            }
+            
+            if (t >= 1.0f) {
+                g_gridAnim.active = false;
+                g_snapshots.clear();
+                for (const auto& item : g_gridAnim.items) {
+                     if (IsWindow(item.hwnd)) {
+                         g_snapshots.push_back({item.hwnd, item.endX, item.endY, item.width, item.height});
+                     }
+                }
+                g_gridAnim.items.clear();
+            }
+        }
+        else if (drag || camAnim) {
             ops.reserve(g_snapshots.size());
             POINT currentOffset = g_camOffset;
 
-            if (anim) {
+            if (camAnim) {
                 auto now = std::chrono::steady_clock::now();
-                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_animTime).count();
-                float t = std::min(1.0f, (float)ms / ANIM_DURATION);
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_camAnimTime).count();
+                float t = std::min(1.0f, (float)ms / CAM_ANIM_DURATION);
                 float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t);
-                currentOffset.x = (int)(g_animStart.x + (g_animTarget.x - g_animStart.x) * ease);
-                currentOffset.y = (int)(g_animStart.y + (g_animTarget.y - g_animStart.y) * ease);
+                currentOffset.x = (int)(g_camAnimStart.x + (g_camAnimTarget.x - g_camAnimStart.x) * ease);
+                currentOffset.y = (int)(g_camAnimStart.y + (g_camAnimTarget.y - g_camAnimStart.y) * ease);
                 g_camOffset = currentOffset;
-                if (t >= 1.0f) g_isAnim.store(false);
-            } else if (drag) {
+                if (t >= 1.0f) g_isCamAnim.store(false);
+            } 
+            else if (drag) {
                 POINT cur = g_currentMouse;
                 POINT last = g_dragStartMouse;
                 g_camOffset.x += (cur.x - last.x);
@@ -408,14 +539,14 @@ void WorkerFunc() {
                 ny = std::max(-5000, std::min(ny, CANVAS_HEIGHT+5000));
                 ops.push_back({s.hwnd, nx, ny, s.width, s.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
             }
-            LeaveCriticalSection(&g_lock);
-            
-            if (!ops.empty()) ApplyMoves(ops);
         }
+        
+        LeaveCriticalSection(&g_lock);
+        
+        if (!ops.empty()) ApplyMoves(ops);
 
-        // Обновление отладки теперь быстрое, так как внутри нет EnumWindows
         static int frameCount = 0;
-        if (++frameCount % 8 == 0) UpdateDebugWindow(); // Оптимизировано для плавности
+        if (++frameCount % 8 == 0) UpdateDebugWindow();
         
         std::this_thread::sleep_for(std::chrono::milliseconds(THREAD_SLEEP_MS));
     }
@@ -425,6 +556,8 @@ void WorkerFunc() {
 // УПРАВЛЕНИЕ
 // ═══════════════════════════════════════════════════════════════════════════════
 void SnapToWindow(HWND target) {
+    if (g_gridAnim.active) return;
+
     EnterCriticalSection(&g_lock);
     if (g_snapshots.empty()) { LeaveCriticalSection(&g_lock); return; }
     WindowSnapshot* found = nullptr;
@@ -436,29 +569,30 @@ void SnapToWindow(HWND target) {
     if (found) {
         int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
         int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
-        g_animStart = g_camOffset;
-        g_animTarget = { screenCx - (found->baseX + found->width/2), screenCy - (found->baseY + found->height/2) };
-        g_animTime = std::chrono::steady_clock::now();
-        g_isAnim.store(true);
+        g_camAnimStart = g_camOffset;
+        g_camAnimTarget = { screenCx - (found->baseX + found->width/2), screenCy - (found->baseY + found->height/2) };
+        g_camAnimTime = std::chrono::steady_clock::now();
+        g_isCamAnim.store(true);
     }
     LeaveCriticalSection(&g_lock);
 }
 
 void StartDrag(POINT p) {
-    g_isAnim.store(false);
+    if (g_gridAnim.active) return;
+    g_isCamAnim.store(false);
     g_isDragging.store(true);
     g_dragStartMouse = p;
     g_currentMouse = p;
-    // TakeSnapshot() убран отсюда для производительности!
-    // Мы используем текущий кэш. Если окно новое - оно не подвинется, пока не сделаем ресет.
 }
 
 void Zoom(float scale) {
+    if (g_gridAnim.active) return;
+
     EnterCriticalSection(&g_lock);
     POINT center = {GetSystemMetrics(SM_CXSCREEN)/2, GetSystemMetrics(SM_CYSCREEN)/2};
     if (g_snapshots.empty()) { LeaveCriticalSection(&g_lock); return; }
     std::vector<WindowMoveOp> ops;
-    ops.reserve(g_snapshots.size()); // Предварительное выделение памяти
+    ops.reserve(g_snapshots.size());
     for (auto& s : g_snapshots) {
         if (!IsWindow(s.hwnd)) continue;
         int physX = s.baseX + g_camOffset.x;
@@ -521,12 +655,19 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
     bool shouldPan = isPanActive || (isActivateActive && isMiddleMouseDown);
 
     if (shouldPan) {
-        if (!g_isDragging.load()) StartDrag(m->pt);
-        g_currentMouse = m->pt;
-        if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN) return 1;
+        if (!g_isDragging.load() && !g_gridAnim.active) StartDrag(m->pt);
+        
+        if (!g_gridAnim.active) {
+             g_currentMouse = m->pt;
+             if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN) return 1;
+        }
         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
     } else {
         if (g_isDragging.load()) g_isDragging.store(false);
+    }
+
+    if (g_gridAnim.active) {
+        return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
     }
 
     if (isActivateActive && !shouldPan) {
@@ -562,7 +703,8 @@ LRESULT CALLBACK KbHook(int nCode, WPARAM wParam, LPARAM lParam) {
 
     if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
         if (CheckDoubleTap(k->vkCode, true)) { HandleDoubleTapReset(); return 1; }
-        if (k->vkCode == VK_NUMPAD5 && (GetAsyncKeyState(g_activateKey) & 0x8000)) {
+        
+        if (!g_gridAnim.active && k->vkCode == VK_NUMPAD5 && (GetAsyncKeyState(g_activateKey) & 0x8000)) {
             int scX = GetSystemMetrics(SM_CXSCREEN)/2, scY = GetSystemMetrics(SM_CYSCREEN)/2;
             long long minD = -1; HWND best = NULL; RECT bestR = {0};
             EnterCriticalSection(&g_lock);
@@ -577,8 +719,8 @@ LRESULT CALLBACK KbHook(int nCode, WPARAM wParam, LPARAM lParam) {
             if (best) {
                 int dx = scX - (bestR.left + (bestR.right-bestR.left)/2);
                 int dy = scY - (bestR.top + (bestR.bottom-bestR.top)/2);
-                g_animStart = g_camOffset; g_animTarget = {g_camOffset.x+dx, g_camOffset.y+dy};
-                g_animTime = std::chrono::steady_clock::now(); g_isAnim.store(true);
+                g_camAnimStart = g_camOffset; g_camAnimTarget = {g_camOffset.x+dx, g_camOffset.y+dy};
+                g_camAnimTime = std::chrono::steady_clock::now(); g_isCamAnim.store(true);
                 return 1;
             }
         }
@@ -603,16 +745,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     if (m == WM_DESTROY) {
-        g_stop.store(true); // Мгновенная остановка цикла
-        
-        // Снимаем хуки сразу
+        g_stop.store(true);
         if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
         if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
         g_mouseHook = NULL; g_kbHook = NULL;
-
-        // Ждем поток (он выйдет сразу, т.к. флаг установлен и хуков нет)
         if (g_worker.joinable()) g_worker.join();
-
         DeleteCriticalSection(&g_lock);
         DeleteCriticalSection(&g_debugLock);
         PostQuitMessage(0);
@@ -633,7 +770,7 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int) {
 
     CreateDebugWindow(h);
     Sleep(100);
-    ArrangeGrid(); // Единственный тяжелый вызов при старте
+    ArrangeGrid();
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
