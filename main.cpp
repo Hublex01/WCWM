@@ -340,6 +340,8 @@ void ApplyMoves(const std::vector<WindowMoveOp>& ops) {
 void ArrangeGrid() {
     std::vector<WindowSnapshot> list;
     list.reserve(64);
+    
+    // 1. Сбор окон (берем текущие реальные координаты)
     EnumWindows([](HWND h, LPARAM l) -> BOOL {
         if (!IsValidWnd(h)) return TRUE;
         RECT r; GetWindowRect(h, &r);
@@ -350,30 +352,25 @@ void ArrangeGrid() {
 
     if (list.empty()) return;
 
-    // 1. Сортировка по площади (от большого к маленькому)
+    // 2. Сортировка: первое окно - самое большое
     std::sort(list.begin(), list.end(), [](const WindowSnapshot& a, const WindowSnapshot& b) {
         return (a.width * a.height) > (b.width * b.height);
     });
 
-    // Структура для хранения занятых областей (чтобы не накладывались)
-    struct PlacedRect {
-        int x, y, w, h;
-    };
+    struct PlacedRect { int x, y, w, h; };
     std::vector<PlacedRect> placed;
     
-    // Подготовка данных для анимации
     EnterCriticalSection(&g_lock);
+    
     g_gridAnim.items.clear();
     g_gridAnim.items.reserve(list.size());
 
-    // 2. Размещение первого (самого большого) в центре (0,0)
+    // Виртуальный центр для алгоритма упаковки (пока считаем от 0,0)
     int centerX = 0;
     int centerY = 0;
     
-    // Вспомогательная функция проверки пересечений
     auto intersects = [&](int nx, int ny, int nw, int nh) {
         for (const auto& pr : placed) {
-            // Проверка пересечения прямоугольников
             if (!(nx + nw <= pr.x || nx >= pr.x + pr.w || ny + nh <= pr.y || ny >= pr.y + pr.h)) {
                 return true;
             }
@@ -381,36 +378,26 @@ void ArrangeGrid() {
         return false;
     };
 
-    // Функция поиска позиции для окна (спиральная упаковка)
     auto findPosition = [&](int w, int h) -> POINT {
         if (placed.empty()) {
-            return {centerX - w/2, centerY - h/2}; // Центр экрана
+            // Первое окно временно ставим в центр виртуальной системы координат
+            return {centerX - w/2, centerY - h/2};
         }
-
-        // Начинаем поиск с центра и двигаемся по спирали
-        // Для упрощения и скорости будем искать позицию, приставляя новое окно 
-        // к одной из сторон уже размещенных окон.
         
         int bestX = 0, bestY = 0;
         long long minDistSq = -1;
 
-        // Пробуем приставить к каждому уже размещенному окну со всех 4 сторон
         for (const auto& pr : placed) {
-            // Кандидаты: Справа, Слева, Снизу, Сверху
             int candidates[4][2] = {
-                {pr.x + pr.w, pr.y},             // Right
-                {pr.x - w, pr.y},                // Left
-                {pr.x, pr.y + pr.h},             // Bottom
-                {pr.x, pr.y - h}                 // Top
+                {pr.x + pr.w, pr.y}, {pr.x - w, pr.y},
+                {pr.x, pr.y + pr.h}, {pr.x, pr.y - h}
             };
 
             for (int i = 0; i < 4; ++i) {
                 int cx = candidates[i][0];
                 int cy = candidates[i][1];
 
-                // Проверяем, не пересекается ли эта позиция с другими
                 if (!intersects(cx, cy, w, h)) {
-                    // Вычисляем расстояние до центра (чтобы фигура была круглой/компактной)
                     int dx = (cx + w/2) - centerX;
                     int dy = (cy + h/2) - centerY;
                     long long distSq = 1LL*dx*dx + 1LL*dy*dy;
@@ -426,29 +413,51 @@ void ArrangeGrid() {
         return {bestX, bestY};
     };
 
-    // 3. Цикл размещения
+    // 3. Расчет позиций (пока виртуальных, относительно 0,0)
+    std::vector<POINT> tempPositions;
+    tempPositions.reserve(list.size());
+
     for (const auto& win : list) {
         POINT pos = findPosition(win.width, win.height);
-        
-        // Добавляем в список занятых
         placed.push_back({pos.x, pos.y, win.width, win.height});
+        tempPositions.push_back(pos);
+    }
 
-        // Добавляем в анимацию
+    // 4. КЛЮЧЕВОЙ МОМЕНТ: Вычисляем смещение для центрирования самого большого окна
+    // Самое большое окно - это list[0] и tempPositions[0]
+    int bigWinCenterX = tempPositions[0].x + list[0].width / 2;
+    int bigWinCenterY = tempPositions[0].y + list[0].height / 2;
+
+    int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
+    int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
+
+    // Насколько нужно сдвинуть всю сетку, чтобы центр большого окна совпал с центром экрана
+    int offsetX = screenCx - bigWinCenterX;
+    int offsetY = screenCy - bigWinCenterY;
+
+    // 5. Формируем итоговую анимацию с учетом смещения
+    for (size_t i = 0; i < list.size(); ++i) {
         GridAnimItem item;
-        item.hwnd = win.hwnd;
-        item.startX = win.baseX; // Текущая позиция
-        item.startY = win.baseY;
-        item.endX = pos.x;       // Новая позиция (плитка)
-        item.endY = pos.y;
-        item.width = win.width;
-        item.height = win.height;
+        item.hwnd = list[i].hwnd;
+        item.startX = list[i].baseX; 
+        item.startY = list[i].baseY;
+        
+        // Применяем смещение к целевой позиции
+        item.endX = tempPositions[i].x + offsetX;
+        item.endY = tempPositions[i].y + offsetY;
+        
+        item.width = list[i].width;
+        item.height = list[i].height;
         
         g_gridAnim.items.push_back(item);
     }
 
+    // Сбрасываем камеру в 0, так как мы уже встроили центрирование в координаты окон
+    g_camOffset = {0, 0};
+
     g_gridAnim.startTime = std::chrono::steady_clock::now();
     g_gridAnim.active = true;
-    g_camOffset = {0, 0};
+    
     LeaveCriticalSection(&g_lock);
 }
 
@@ -579,6 +588,31 @@ void SnapToWindow(HWND target) {
 
 void StartDrag(POINT p) {
     if (g_gridAnim.active) return;
+    
+    // 1. СИНХРОНИЗАЦИЯ: Обновляем координаты окон перед началом движения камеры
+    EnterCriticalSection(&g_lock);
+    for (auto& s : g_snapshots) {
+        if (IsWindow(s.hwnd)) {
+            RECT r;
+            if (GetWindowRect(s.hwnd, &r)) {
+                // Получаем текущие экранные координаты
+                int realX = r.left;
+                int realY = r.top;
+                
+                // Вычисляем новые базовые координаты относительно текущего смещения камеры
+                // Формула: Base = Real - CameraOffset
+                s.baseX = realX - g_camOffset.x;
+                s.baseY = realY - g_camOffset.y;
+                
+                // Также на всякий случай обновляем размер, если окно изменилось
+                s.width = r.right - r.left;
+                s.height = r.bottom - r.top;
+            }
+        }
+    }
+    LeaveCriticalSection(&g_lock);
+
+    // 2. СТАРТ ДВИЖЕНИЯ
     g_isCamAnim.store(false);
     g_isDragging.store(true);
     g_dragStartMouse = p;
