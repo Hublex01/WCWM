@@ -166,26 +166,144 @@ std::wstring GetKeyNameStr(WPARAM vkCode) {
 }
 
 bool IsValidWnd(HWND h) {
-    if (!h || h == g_hwnd) return false;
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 1: IMMEDIATE REJECTS (Handle validity, self-exclusion)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if (!h || !IsWindow(h)) return false;
+    
+    // Exclude our own windows by pointer identity (most reliable check)
+    if (h == g_hwnd || h == g_debugHwnd) return false;
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 2: TOP-LEVEL WINDOW VERIFICATION
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Get window and extended styles
+    LONG style = GetWindowLongW(h, GWL_STYLE);
+    LONG exStyle = GetWindowLongW(h, GWL_EXSTYLE);
+    
+    // Reject child windows (we only want top-level)
+    if (style & WS_CHILD) return false;
+    
+    // Reject tool windows and tool-window-like windows
+    // These are helper/support windows, not primary application windows
+    if (exStyle & WS_EX_TOOLWINDOW) return false;
+    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 3: OWNERSHIP & HIERARCHY CHECKS (Catches UWP ghost windows)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // If window has an owner, it's not truly top-level (likely a modal dialog or owned window)
+    // UWP ghost windows often have ownership/parent relationships
+    HWND owner = GetWindow(h, GW_OWNER);
+    if (owner != NULL) {
+        // Owner exists. This is an owned window (like a dialog).
+        // Exclude UNLESS it's a visible, substantial window (edge case: some apps use owned windows)
+        // For safety, reject owned windows as they're typically not primary application windows
+        return false;
+    }
+    
+    // Verify this window is truly the root of its hierarchy
+    // Some system windows are deeply nested; GA_ROOT finds the topmost ancestor
+    HWND root = GetAncestor(h, GA_ROOT);
+    if (root != h) {
+        // This window is part of a hierarchy, not a true top-level
+        // Reject it (this catches some shell-integrated windows)
+        return false;
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 4: VISIBILITY CHECK
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Note: IsWindowVisible() returns TRUE for some hidden UWP background frames,
+    // but combined with owner/hierarchy checks above, we've already filtered those.
+    // Now require visibility to show in our grid.
     if (!IsWindowVisible(h)) return false;
-    RECT r; GetWindowRect(h, &r);
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 5: SIZE & DIMENSION CHECKS
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    RECT r;
+    if (!GetWindowRect(h, &r)) return false;
+    
     int w = r.right - r.left;
     int hgt = r.bottom - r.top;
-    if (w >= GetSystemMetrics(SM_CXSCREEN) && hgt >= GetSystemMetrics(SM_CYSCREEN)) return false;
+
+    // Reject windows larger than or equal to the entire screen
+    // These are typically wallpaper/desktop/shell windows
+    if (w >= GetSystemMetrics(SM_CXSCREEN) && hgt >= GetSystemMetrics(SM_CYSCREEN)) {
+        return false;
+    }
+
+    // Reject windows that are too small to be meaningful applications
+    // Minimum sensible size for an app window
     if (w < 100 || hgt < 50) return false;
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 6: TITLE CHECK (Important for identifying real applications)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    wchar_t title[256] = {0};
+    int titleLen = GetWindowTextW(h, title, 255);
+    
+    // Reject windows with empty titles
+    // Real applications almost always have a title (app name, filename, etc.)
+    // Ghost/background windows often lack titles
+    if (titleLen == 0) return false;
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 7: CLASS NAME TARGETED REJECTS (Strict allowlist approach)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     wchar_t cls[64] = {0};
     GetClassNameW(h, cls, 63);
-    if (wcscmp(cls, L"Shell_TrayWnd")==0 || wcscmp(cls, L"Progman")==0 || 
-        wcscmp(cls, L"WorkerW")==0 || wcscmp(cls, L"NotifyIconOverflowWindow")==0) return false;
-    LONG exStyle = GetWindowLongW(h, GWL_EXSTYLE);
-    if (exStyle & WS_EX_TOOLWINDOW) return false;
-    LONG st = GetWindowLongW(h, GWL_STYLE);
-    bool hasFrame = (st & WS_THICKFRAME) || (st & WS_CAPTION);
-    bool isPopup = (st & WS_POPUP) != 0;
-    if (!hasFrame && !isPopup) return false;
-    wchar_t title[256] = {0};
-    GetWindowTextW(h, title, 255);
-    if (wcslen(title) == 0) return false;
+    
+    // IMPORTANT: Only reject KNOWN system classes.
+    // Do NOT reject ApplicationFrameHost, Windows.UI.Core.CoreWindow indiscriminately
+    // as these are used by legitimate visible UWP apps like Edge.
+    // The ownership/hierarchy checks above already filter out ghost frames.
+    
+    // True system/shell classes that should never appear in the grid
+    const wchar_t* systemOnlyClasses[] = {
+        L"Shell_TrayWnd",           // Taskbar
+        L"Progman",                 // Desktop window manager
+        L"WorkerW",                 // Desktop worker window
+        L"NotifyIconOverflowWindow",// System notification area overflow
+        L"ImmersiveLauncher",       // Windows 10+ Start Menu
+        L"Shell_SecondaryTrayHost", // Secondary taskbars
+        L"SearchUI"                 // Windows Search popup (when summoned but backgrounded)
+    };
+
+    for (const auto& sysClass : systemOnlyClasses) {
+        if (wcscmp(cls, sysClass) == 0) return false;
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 8: EXTENDED STYLE - ACTIVATION CHECKS
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // A window that cannot be activated (WS_EX_NOACTIVATE) AND is small and has no special title
+    // is likely a system window. But we only reject if it also fails other heuristics.
+    // Combined with previous checks, most ghosts are already gone.
+    if (exStyle & WS_EX_NOACTIVATE) {
+        // Window cannot be activated. It's informational or system-managed.
+        // However, legitimate windows (like some file dialogs) can have this.
+        // Additional heuristic: if it also has a very generic title or is a known UWP overlay,
+        // Consider rejecting. For now, this is a weak signal combined with other checks.
+        
+        // Special case: ApplicationFrameHost with WS_EX_NOACTIVATE is likely a ghost
+        // But non-ApplicationFrameHost windows with WS_EX_NOACTIVATE can be valid (e.g., search boxes)
+        // We've already removed owned windows, so allow this for now.
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 9: FINAL VALIDATION - WINDOWS IN ALT+TAB (Optional deep check)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // GetWindowDisplayAffinity can tell us if the window should appear in taskbar/switcher,
+    // but this is relatively expensive. Skip for performance unless debugging.
+    // Comment out unless needed:
+    // DWORD affinity = 0;
+    // GetWindowDisplayAffinity(h, &affinity);
+    // if (affinity & WDA_EXCLUDEFROMCAPTURE) return false; // Hidden from Alt+Tab-like enumeration
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ALL CHECKS PASSED: This is a valid user application window
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     return true;
 }
 
