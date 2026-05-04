@@ -8,6 +8,8 @@
 #include <sstream>
 #include <string>
 #include <iomanip>
+#include <shlobj.h>
+#include <cstdio>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -16,6 +18,75 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 const int CANVAS_WIDTH  = 10000;
 const int CANVAS_HEIGHT = 10000;
+
+// Структура конфигурации
+struct Config {
+    WPARAM activateKey;
+    WPARAM panKey;
+
+    Config() : activateKey(VK_RCONTROL), panKey(0) {}
+};
+
+// Путь к config.ini (%APPDATA%\WCWM\config.ini)
+std::wstring GetConfigPath() {
+    wchar_t appData[MAX_PATH];
+    SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appData);
+    std::wstring path = std::wstring(appData) + L"\\WCWM\\config.ini";
+    return path;
+}
+
+// Создать директорию %APPDATA%\WCWM если её нет
+void EnsureConfigDir() {
+    std::wstring path = GetConfigPath();
+    size_t pos = path.find_last_of(L'\\');
+    if (pos != std::wstring::npos) {
+        std::wstring dir = path.substr(0, pos);
+        CreateDirectoryW(dir.c_str(), NULL);
+    }
+}
+
+// Загрузить конфиг из файла (если нет — использовать дефолты)
+Config LoadConfig() {
+    Config cfg;
+    std::wstring path = GetConfigPath();
+
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return cfg; // Файла нет — возвращаем дефолты
+    }
+
+    // Читаем значения из INI
+    int activate = GetPrivateProfileIntW(L"General", L"activateKey", (int)cfg.activateKey, path.c_str());
+    int pan = GetPrivateProfileIntW(L"General", L"panKey", (int)cfg.panKey, path.c_str());
+
+    // Валидация: проверяем разумные диапазоны виртуальных кодов (1..255)
+    if (activate >= 1 && activate <= 255) cfg.activateKey = (WPARAM)activate;
+    else cfg.activateKey = VK_RCONTROL;
+
+    if (pan >= 0 && pan <= 255) cfg.panKey = (WPARAM)pan;
+    else cfg.panKey = 0;
+
+    return cfg;
+}
+
+// Сохранить конфиг атомарно (через temp-файл + rename)
+void SaveConfig(const Config& cfg) {
+    EnsureConfigDir();
+    std::wstring path = GetConfigPath();
+    std::wstring tmpPath = path + L".tmp";
+
+    // Пишем во временный файл
+    wchar_t buf[32];
+    swprintf_s(buf, L"%d", (int)cfg.activateKey);
+    WritePrivateProfileStringW(L"General", L"activateKey", buf, tmpPath.c_str());
+    swprintf_s(buf, L"%d", (int)cfg.panKey);
+    WritePrivateProfileStringW(L"General", L"panKey", buf, tmpPath.c_str());
+
+    // Атомарная замена
+    MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
+
+// Глобальный экземпляр конфига
+Config g_config;
 
 WPARAM g_activateKey = VK_RCONTROL;
 WPARAM g_panKey = 0;
@@ -1131,8 +1202,14 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
             else if (wParam == WM_MBUTTONDOWN) newKey = VK_MBUTTON;
             else if (wParam == WM_XBUTTONDOWN) newKey = (HIWORD(m->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
             
-            if (g_bindingPanKey) g_panKey = newKey; 
-            else g_activateKey = newKey;
+            if (g_bindingPanKey) {
+                g_panKey = newKey;
+                g_config.panKey = g_panKey;
+            } else {
+                g_activateKey = newKey;
+                g_config.activateKey = g_activateKey;
+            }
+            SaveConfig(g_config);
             
             g_bindingMode = false;
             if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
@@ -1270,14 +1347,21 @@ LRESULT CALLBACK KbHook(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode < 0) return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
     KBDLLHOOKSTRUCT* k = (KBDLLHOOKSTRUCT*)lParam;
 
-    if (g_bindingMode && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-        if (k->vkCode != VK_LWIN && k->vkCode != VK_RWIN && k->vkCode != VK_APPS) {
-            if (g_bindingPanKey) g_panKey = k->vkCode; else g_activateKey = k->vkCode;
-            g_bindingMode = false;
-            if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
-            return 1;
-        }
-    }
+     if (g_bindingMode && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+         if (k->vkCode != VK_LWIN && k->vkCode != VK_RWIN && k->vkCode != VK_APPS) {
+             if (g_bindingPanKey) {
+                 g_panKey = k->vkCode;
+                 g_config.panKey = g_panKey;
+             } else {
+                 g_activateKey = k->vkCode;
+                 g_config.activateKey = g_activateKey;
+             }
+             SaveConfig(g_config);
+             g_bindingMode = false;
+             if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
+             return 1;
+         }
+     }
 
     if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
         if (CheckDoubleTap(k->vkCode, true)) { HandleDoubleTapReset(); return 1; }
@@ -1320,6 +1404,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     if (m == WM_DESTROY) {
+        // Сохраняем конфигурацию перед выходом (страховка)
+        g_config.activateKey = g_activateKey;
+        g_config.panKey = g_panKey;
+        SaveConfig(g_config);
+
         g_stop.store(true);
         if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
         if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
@@ -1335,6 +1424,12 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int) {
     if (!IsAdmin()) RunAsAdmin();
+
+    // Загружаем конфигурацию ДО создания окон/хуков
+    g_config = LoadConfig();
+    g_activateKey = g_config.activateKey;
+    g_panKey = g_config.panKey;
+
     WNDCLASSEXW wcMain = {sizeof(wcMain)};
     wcMain.lpfnWndProc = WndProc; wcMain.hInstance = h; wcMain.lpszClassName = L"CanvasDesk";
     RegisterClassExW(&wcMain);
