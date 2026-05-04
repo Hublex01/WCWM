@@ -139,6 +139,56 @@ struct SortedWindow {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ЗАЩИТА ОТ ВТОРОЙ КОПИИ (SINGLE INSTANCE)
+// ═══════════════════════════════════════════════════════════════════════════════
+HANDLE g_hSingleInstanceMutex = NULL; // Хэндл мьютекса — глобально, чтобы не закрылся досрочно
+
+// Проверка единственного экземпляра
+bool CheckSingleInstance() {
+    // Имя мьютекса: Local\ для изоляции по пользователям, GUID для абсолютной уникальности
+    const wchar_t* MUTEX_NAME = L"Local\\WCWM_SingleInstance_B7F2A9E4-1C3D-48B5-9A6E-3F8C2D1B0A9E";
+    g_hSingleInstanceMutex = CreateMutexW(
+        NULL,           // Атрибуты безопасности по умолчанию
+        TRUE,           // Вызывающий поток сразу владеет мьютексом
+        MUTEX_NAME      // Имя мьютекса
+    );
+    
+    if (g_hSingleInstanceMutex == NULL) {
+        // Не удалось создать мьютекс (ошибка системы) — из соображений безопасности запрещаем запуск
+        return false;
+    }
+    
+    DWORD lastError = GetLastError();
+    if (lastError == ERROR_ALREADY_EXISTS) {
+        // Мьютекс уже существовал — значит, программа уже запущена
+        return false;
+    }
+    
+    // Мьютекс создан впервые — продолжаем работу
+    return true;
+}
+
+// Активация уже работающего экземпляра
+void ActivateExistingInstance() {
+    // Ищем главное окно по классу
+    HWND hExisting = FindWindowW(L"CanvasDesk", NULL);
+    if (hExisting != NULL) {
+        // Восстанавливаем если свернуто
+        if (IsIconic(hExisting)) {
+            ShowWindow(hExisting, SW_RESTORE);
+        }
+        // Выводим на передний план
+        SetForegroundWindow(hExisting);
+    }
+    
+    // Показываем сообщение пользователю
+    MessageBoxW(NULL, 
+        L"Программа уже запущена.\n\nПриложение может управлять окнами и установлено глобальные хуки ввода.\nЗапуск второй копии приведет к конфликту.",
+        L"WCWM — Программа уже запущена",
+        MB_ICONINFORMATION | MB_OK);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 // ═══════════════════════════════════════════════════════════════════════════════
 std::atomic<bool> g_isDragging(false);
@@ -1423,6 +1473,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int) {
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // ПРОВЕРКА ЕДИНОГО ЭКЗЕМПЛЯРА — ПЕРВЫМ ДЕЛОМ
+    // ═══════════════════════════════════════════════════════════════════════════════
+    if (!CheckSingleInstance()) {
+        ActivateExistingInstance();
+        return 0;
+    }
+
     if (!IsAdmin()) RunAsAdmin();
 
     // Загружаем конфигурацию ДО создания окон/хуков
