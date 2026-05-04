@@ -71,6 +71,7 @@ struct SortedWindow {
 // ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 // ═══════════════════════════════════════════════════════════════════════════════
 std::atomic<bool> g_isDragging(false);
+std::atomic<WPARAM> g_panStartButton = 0; // Запоминаем, какая кнопка начала тягу (VK_MBUTTON, VK_LBUTTON и т.д.)
 POINT g_dragStartMouse = {0, 0};
 POINT g_currentMouse = {0, 0};
 std::vector<WindowSnapshot> g_snapshots;
@@ -172,7 +173,7 @@ bool IsValidWnd(HWND h) {
     if (!h || !IsWindow(h)) return false;
     
     // Exclude our own windows by pointer identity (most reliable check)
-    if (h == g_hwnd || h == g_debugHwnd) return false;
+    if (h == g_hwnd) return false;
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // PHASE 2: TOP-LEVEL WINDOW VERIFICATION
@@ -767,8 +768,12 @@ void Zoom(float scale) {
 // ═══════════════════════════════════════════════════════════════════════════════
 LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode < 0) return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+    
     MSLLHOOKSTRUCT* m = (MSLLHOOKSTRUCT*)lParam;
 
+    // ========================================================================
+    // 1. РЕЖИМ ПРИВЯЗКИ КЛАВИШ
+    // ========================================================================
     if (g_bindingMode) {
         if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN) {
             WPARAM newKey = 0;
@@ -777,7 +782,9 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
             else if (wParam == WM_MBUTTONDOWN) newKey = VK_MBUTTON;
             else if (wParam == WM_XBUTTONDOWN) newKey = (HIWORD(m->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
             
-            if (g_bindingPanKey) g_panKey = newKey; else g_activateKey = newKey;
+            if (g_bindingPanKey) g_panKey = newKey; 
+            else g_activateKey = newKey;
+            
             g_bindingMode = false;
             if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
             return 1;
@@ -785,44 +792,108 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
     }
 
-    bool isPanActive = false, isActivateActive = false;
-    bool isMiddleMouseDown = (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+    // ========================================================================
+    // 2. ГЛАВНАЯ ЛОГИКА: КОНЕЧНЫЙ АВТОМАТ
+    // ========================================================================
 
-    if (g_panKey >= VK_LBUTTON && g_panKey <= VK_XBUTTON2) {
-        if ((g_panKey == VK_LBUTTON && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) ||
-            (g_panKey == VK_RBUTTON && (GetAsyncKeyState(VK_RBUTTON) & 0x8000)) ||
-            (g_panKey == VK_MBUTTON && (GetAsyncKeyState(VK_MBUTTON) & 0x8000)) ||
-            (g_panKey == VK_XBUTTON1 && (GetAsyncKeyState(VK_XBUTTON1) & 0x8000)) ||
-            (g_panKey == VK_XBUTTON2 && (GetAsyncKeyState(VK_XBUTTON2) & 0x8000))) isPanActive = true;
-    } else if (g_panKey != 0 && (GetAsyncKeyState(g_panKey) & 0x8000)) isPanActive = true;
-
-    if (g_activateKey >= VK_LBUTTON && g_activateKey <= VK_XBUTTON2) {
-        if ((g_activateKey == VK_LBUTTON && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) ||
-            (g_activateKey == VK_RBUTTON && (GetAsyncKeyState(VK_RBUTTON) & 0x8000)) ||
-            (g_activateKey == VK_MBUTTON && (GetAsyncKeyState(VK_MBUTTON) & 0x8000)) ||
-            (g_activateKey == VK_XBUTTON1 && (GetAsyncKeyState(VK_XBUTTON1) & 0x8000)) ||
-            (g_activateKey == VK_XBUTTON2 && (GetAsyncKeyState(VK_XBUTTON2) & 0x8000))) isActivateActive = true;
-    } else if (g_activateKey != 0 && (GetAsyncKeyState(g_activateKey) & 0x8000)) isActivateActive = true;
-
-    bool shouldPan = isPanActive || (isActivateActive && isMiddleMouseDown);
-
-    if (shouldPan) {
-        if (!g_isDragging.load() && !g_gridAnim.active) StartDrag(m->pt);
-        
+    // --- СОСТОЯНИЕ 1: МЫ УЖЕ ТАЩИМ (DRAG ACTIVE) ---
+    if (g_isDragging.load()) {
+        // А. Обновляем координаты для рабочего потока
         if (!g_gridAnim.active) {
-             g_currentMouse = m->pt;
-             if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN) return 1;
+            g_currentMouse = m->pt;
         }
+
+        // Б. Проверяем, отпустили ли мы ТУ САМУЮ кнопку, которой начали тянуть
+        bool isStopEvent = false;
+        WPARAM startBtn = g_panStartButton.load();
+
+        if (wParam == WM_LBUTTONUP && startBtn == VK_LBUTTON) isStopEvent = true;
+        else if (wParam == WM_RBUTTONUP && startBtn == VK_RBUTTON) isStopEvent = true;
+        else if (wParam == WM_MBUTTONUP && startBtn == VK_MBUTTON) isStopEvent = true;
+        else if (wParam == WM_XBUTTONUP) {
+            WORD xBtn = HIWORD(m->mouseData);
+            if ((startBtn == VK_XBUTTON1 && xBtn == XBUTTON1) || 
+                (startBtn == VK_XBUTTON2 && xBtn == XBUTTON2)) {
+                isStopEvent = true;
+            }
+        }
+
+        // В. Если отпустили "ту самую" кнопку -> ЗАВЕРШАЕМ
+        if (isStopEvent) {
+            g_isDragging.store(false);
+            g_panStartButton.store(0);
+            return 1; // БЛОКИРУЕМ событие
+        }
+
+        // Г. Блокируем любые другие нажатия/отпускания во время драга
+        if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN ||
+            wParam == WM_LBUTTONUP || wParam == WM_RBUTTONUP || wParam == WM_MBUTTONUP || wParam == WM_XBUTTONUP) {
+            return 1;
+        }
+
+        // Д. Пропускаем движение мыши и колесо
         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
-    } else {
-        if (g_isDragging.load()) g_isDragging.store(false);
     }
 
+    // --- СОСТОЯНИЕ 2: МЫ НЕ ТАЩИМ (IDLE) -> ПРОВЕРЯЕМ ЗАПУСК ---
+    
     if (g_gridAnim.active) {
         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
     }
 
-    if (isActivateActive && !shouldPan) {
+    // Проверяем, является ли текущее событие НАЖАТИЕМ кнопки
+    bool isPressEvent = false;
+    WPARAM pressedKey = 0;
+
+    if (wParam == WM_LBUTTONDOWN) { isPressEvent = true; pressedKey = VK_LBUTTON; }
+    else if (wParam == WM_RBUTTONDOWN) { isPressEvent = true; pressedKey = VK_RBUTTON; }
+    else if (wParam == WM_MBUTTONDOWN) { isPressEvent = true; pressedKey = VK_MBUTTON; }
+    else if (wParam == WM_XBUTTONDOWN) { 
+        isPressEvent = true; 
+        pressedKey = (HIWORD(m->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2; 
+    }
+
+    if (isPressEvent) {
+        bool shouldStartDrag = false;
+
+        // ЛОГИКА ЗАПУСКА (Два независимых условия):
+        
+        // 1. Нажата назначенная клавиша Pan Key (если она != 0)
+        if (g_panKey != 0 && pressedKey == g_panKey) {
+            shouldStartDrag = true;
+        }
+        
+        // 2. Комбо: Нажата клавиша Активации (Ctrl) + СРЕДНЯЯ кнопка мыши
+        // Работает ВСЕГДА, независимо от Pan Key
+        if (pressedKey == VK_MBUTTON) {
+            // Проверяем, зажата ли клавиша активации в момент нажатия средней кнопки
+            bool isActivateHeld = false;
+            if (g_activateKey != 0) {
+                if (GetAsyncKeyState(g_activateKey) & 0x8000) isActivateHeld = true;
+            }
+            
+            if (isActivateHeld) {
+                shouldStartDrag = true;
+            }
+        }
+
+        if (shouldStartDrag) {
+            g_panStartButton.store(pressedKey); // Запоминаем, чем начали
+            StartDrag(m->pt);                   // Инициализируем drag
+            return 1;                           // Блокируем исходное нажатие
+        }
+    }
+
+    // ========================================================================
+    // 3. ОБРАБОТКА АКТИВАЦИИ (Зум и Фокус)
+    // ========================================================================
+    
+    bool isActivateHeld = false;
+    if (g_activateKey != 0) {
+        if (GetAsyncKeyState(g_activateKey) & 0x8000) isActivateHeld = true;
+    }
+
+    if (isActivateHeld) {
         if (wParam == WM_LBUTTONDOWN) {
             HWND h = WindowFromPoint(m->pt);
             if (h) SnapToWindow(GetAncestor(h, GA_ROOTOWNER));
@@ -834,9 +905,7 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
         }
     }
 
-    if (g_panKey == 0 && wParam == WM_MBUTTONDOWN && !isActivateActive) { StartDrag(m->pt); return 1; }
-    if (g_panKey == 0 && wParam == WM_MBUTTONUP) { g_isDragging.store(false); return 1; }
-
+    // Пропускаем все остальные события
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 }
 
