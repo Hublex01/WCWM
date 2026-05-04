@@ -963,13 +963,23 @@ void WorkerFunc() {
         } 
         else {
             // 3.C Отрисовка обычных окон
+            // 3.C Отрисовка обычных окон
             for (auto& s : localSnapshots) {
-                if (!IsWindow(s.hwnd)) continue;
-                int nx = s.baseX + localCamOffset.x;
-                int ny = s.baseY + localCamOffset.y;
+            if (!IsWindow(s.hwnd)) continue;
+        
+            int nx = s.baseX + localCamOffset.x;
+            int ny = s.baseY + localCamOffset.y;
+                
+            // === НОВОЕ УСЛОВИЕ ===
+            // Двигаем окна ТОЛЬКО если идет перетаскивание холста (Drag) 
+            // ИЛИ идет какая-то анимация (сетка/камера).
+            // В обычном режиме (Idle) мы НЕ трогаем окна вообще.
+            if (localDrag || localGridActive || localCamAnim) {
                 nx = std::max(-5000, std::min(nx, CANVAS_WIDTH + 5000));
                 ny = std::max(-5000, std::min(ny, CANVAS_HEIGHT + 5000));
                 ops.push_back({s.hwnd, nx, ny, s.width, s.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
+            }   
+            // =====================
             }
         }
 
