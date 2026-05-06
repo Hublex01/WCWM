@@ -725,10 +725,13 @@ void ArrangeGrid() {
         g_gridAnim.items.push_back(item);
     }
 
+    EnterCriticalSection(&g_lock);
     g_camOffset = {0, 0};
+    LeaveCriticalSection(&g_lock);
+
     g_gridAnim.startTime = std::chrono::steady_clock::now();
     g_gridAnim.active = true;
-    
+
     LeaveCriticalSection(&g_lock);
 }
 
