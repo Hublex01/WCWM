@@ -1231,6 +1231,24 @@ void StartDrag(POINT p) {
     g_mouseDeltaY.store(0, std::memory_order_relaxed);
 }
 
+// Проверка лимитов масштабирования
+bool CheckScaleLimits(int width, int height) {
+    // Минимум: любая сторона должна быть >= 100px
+    if (width < 100 || height < 100) {
+        return false;
+    }
+
+    // Максимум: любая сторона должна быть <= 98% от размера экрана
+    int maxWidth = (int)(GetSystemMetrics(SM_CXSCREEN) * 0.98f);
+    int maxHeight = (int)(GetSystemMetrics(SM_CYSCREEN) * 0.98f);
+
+    if (width > maxWidth || height > maxHeight) {
+        return false;
+    }
+
+    return true;
+}
+
 void Zoom(float scale) {
     if (g_gridAnim.active) return;
 
@@ -1241,16 +1259,27 @@ void Zoom(float scale) {
     ops.reserve(g_snapshots.size());
     for (auto& s : g_snapshots) {
         if (!IsWindow(s.hwnd)) continue;
+
+        // Вычисляем новый размер с сохранением пропорций
+        int nw = (int)(s.width * scale);
+        int nh = (int)(s.height * scale);
+
+        // Проверяем лимиты - если не проходит, пропускаем это окно
+        if (!CheckScaleLimits(nw, nh)) {
+            continue;
+        }
+
+        // Масштабируем относительно центра экрана
         int physX = s.baseX + g_camOffset.x;
         int physY = s.baseY + g_camOffset.y;
         int ncx = center.x + (int)((physX + s.width/2 - center.x) * scale);
         int ncy = center.y + (int)((physY + s.height/2 - center.y) * scale);
-        int nw = std::max(100, (int)(s.width * scale));
-        int nh = std::max(100, (int)(s.height * scale));
+
         ops.push_back({s.hwnd, ncx - nw/2, ncy - nh/2, nw, nh, SWP_NOZORDER|SWP_NOACTIVATE});
         s.baseX = (ncx - nw/2) - g_camOffset.x;
         s.baseY = (ncy - nh/2) - g_camOffset.y;
-        s.width = nw; s.height = nh;
+        s.width = nw;
+        s.height = nh;
     }
     LeaveCriticalSection(&g_lock);
     ApplyMoves(ops);
