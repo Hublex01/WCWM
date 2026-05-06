@@ -190,17 +190,20 @@ void ActivateExistingInstance() {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════════
 std::atomic<bool> g_isDragging(false);
 std::atomic<WPARAM> g_panStartButton = 0; // Запоминаем, какая кнопка начала тягу (VK_MBUTTON, VK_LBUTTON и т.д.)
-POINT g_dragStartMouse = {0, 0};
-POINT g_currentMouse = {0, 0};
 std::vector<WindowSnapshot> g_snapshots;
 std::vector<HWND> g_newWindowsFound; // Нееповторяющийся буфер новых окон
 std::wstring g_newWindowNotice;
 CRITICAL_SECTION g_lock;
 std::thread g_worker;
 std::atomic<bool> g_stop(false);
+
+// Delta-accumulation для плавного перетаскивания
+std::atomic<long> g_mouseDeltaX{0};
+std::atomic<long> g_mouseDeltaY{0};
+POINT g_lastHookMousePos = {0, 0};
 
 HHOOK g_mouseHook = NULL;
 HHOOK g_kbHook = NULL;
@@ -831,10 +834,9 @@ void WorkerFunc() {
     auto lastWindowScan = std::chrono::steady_clock::now();
     auto lastDebugUpdate = std::chrono::steady_clock::now();
     
-    while (!g_stop.load()) {
-        bool drag = g_isDragging.load() && !g_autoCamAnim.load();
-        bool camAnim = g_isCamAnim.load();
-        bool gridAnim = g_gridAnim.active;
+      while (!g_stop.load()) {
+          bool camAnim = g_isCamAnim.load();
+          bool gridAnim = g_gridAnim.active;
 
         // ============================================================
         // 1. ПЕРИОДИЧЕСКОЕ СКАНИРОВАНИЕ НОВЫХ ОКОН (Раз в 1 сек)
@@ -947,21 +949,18 @@ void WorkerFunc() {
             }
         }
 
-        // ============================================================
-        // 2. ПОДГОТОВКА КАДРА (Сбор данных под локом)
-        // ============================================================
-        std::vector<WindowMoveOp> ops;
-        std::vector<PendingWindow> localPending;
-        std::vector<GridAnimItem> localGridItems;
-        bool localGridActive = false;
-        POINT localCamOffset = {0,0};
-        bool localDrag = drag;
-        POINT localDragStart = g_dragStartMouse;
-        POINT localCurMouse = g_currentMouse;
-        bool localCamAnim = camAnim;
-        POINT localCamStart = g_camAnimStart;
-        POINT localCamTarget = g_camAnimTarget;
-        auto localCamTime = g_camAnimTime;
+         // ============================================================
+         // 2. ПОДГОТОВКА КАДРА (Сбор данных под локом)
+         // ============================================================
+         std::vector<WindowMoveOp> ops;
+         std::vector<PendingWindow> localPending;
+         std::vector<GridAnimItem> localGridItems;
+         bool localGridActive = false;
+         POINT localCamOffset = {0,0};
+         bool localCamAnim = camAnim;
+         POINT localCamStart = g_camAnimStart;
+         POINT localCamTarget = g_camAnimTarget;
+         auto localCamTime = g_camAnimTime;
         std::vector<WindowSnapshot> localSnapshots;
 
         EnterCriticalSection(&g_lock);
@@ -1012,97 +1011,114 @@ void WorkerFunc() {
                     g_autoCamAnim.store(false);
                 }
             }
-        } else if (localDrag) {
-            POINT cur = localCurMouse;
-            POINT last = localDragStart;
-            localCamOffset.x += (cur.x - last.x);
-            localCamOffset.y += (cur.y - last.y);
-            g_camOffset = localCamOffset; // Синхронизируем глобально
-            g_dragStartMouse = cur;      // Обновляем глобальный старт для следующего кадра
-        }
+         }
 
-        // Копируем pending окна
-        localPending = g_pendingWindows;
-        
-        // Копируем состояние сетки
-        localGridActive = g_gridAnim.active;
-        if (localGridActive) {
-            localGridItems = g_gridAnim.items;
-        }
+         // Копируем pending окна
+         localPending = g_pendingWindows;
 
-        LeaveCriticalSection(&g_lock); // ОСВОБОЖДАЕМ ЛОК ЗДЕСЬ! Дальше только вычисления и рендер
+         // Копируем состояние сетки
+         localGridActive = g_gridAnim.active;
+         if (localGridActive) {
+             localGridItems = g_gridAnim.items;
+         }
 
-        // ============================================================
-        // 3. ВЫЧИСЛЕНИЕ ПОЗИЦИЙ И ОТРИСОВКА (БЕЗ ЛОКА)
-        // ============================================================
-        
-        int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
-        int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
+          LeaveCriticalSection(&g_lock); // ОСВОБОЖДАЕМ ЛОК ЗДЕСЬ! Дальше только вычисления и рендер
 
-        // 3.A Отрисовка Pending окон (висят в центре)
-        for (const auto& pw : localPending) {
-            if (!IsWindow(pw.hwnd)) continue;
-            ops.push_back({pw.hwnd, screenCx - pw.width / 2, screenCy - pw.height / 2, pw.width, pw.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
-        }
+          // ============================================================
+          // 3. ВЫЧИСЛЕНИЕ ПОЗИЦИЙ И ОТРИСОВКА (БЕЗ ЛОКА)
+          // ============================================================
 
-        // 3.B Отрисовка анимации сетки
-        if (localGridActive) {
-            auto animNow = std::chrono::steady_clock::now();
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(animNow - g_gridAnim.startTime).count();
-            float t = std::min(1.0f, (float)ms / g_gridAnim.durationMs);
-            float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t);
-            
-            for (const auto& item : localGridItems) {
-                if (!IsWindow(item.hwnd)) continue;
-                int curX = (int)(item.startX + (item.endX - item.startX) * ease);
-                int curY = (int)(item.startY + (item.endY - item.startY) * ease);
-                ops.push_back({item.hwnd, curX, curY, item.width, item.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
-            }
+          int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
+          int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
 
-            if (t >= 1.0f) {
-                EnterCriticalSection(&g_lock);
-                g_gridAnim.active = false;
-                for (const auto& item : g_gridAnim.items) {
-                    if (!IsWindow(item.hwnd)) continue;
-                    bool exists = false;
-                    for (const auto& s : g_snapshots) {
-                        if (s.hwnd == item.hwnd) { exists = true; break; }
-                    }
-                    if (!exists) {
-                        int relativeX = item.endX - g_camOffset.x;
-                        int relativeY = item.endY - g_camOffset.y;
-                        g_snapshots.push_back({item.hwnd, relativeX, relativeY, item.width, item.height});
-                    }
-                    auto it = std::find(g_newWindowsFound.begin(), g_newWindowsFound.end(), item.hwnd);
-                    if (it != g_newWindowsFound.end()) {
-                        g_newWindowsFound.erase(it);
-                    }
-                }
-                g_gridAnim.items.clear();
-                LeaveCriticalSection(&g_lock);
-            }
-        } 
-        else {
-            // 3.C Отрисовка обычных окон
-            // 3.C Отрисовка обычных окон
-            for (auto& s : localSnapshots) {
-            if (!IsWindow(s.hwnd)) continue;
-        
-            int nx = s.baseX + localCamOffset.x;
-            int ny = s.baseY + localCamOffset.y;
-                
-            // === НОВОЕ УСЛОВИЕ ===
-            // Двигаем окна ТОЛЬКО если идет перетаскивание холста (Drag) 
-            // ИЛИ идет какая-то анимация (сетка/камера).
-            // В обычном режиме (Idle) мы НЕ трогаем окна вообще.
-            if (localDrag || localGridActive || localCamAnim) {
-                nx = std::max(-5000, std::min(nx, CANVAS_WIDTH + 5000));
-                ny = std::max(-5000, std::min(ny, CANVAS_HEIGHT + 5000));
-                ops.push_back({s.hwnd, nx, ny, s.width, s.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
-            }   
-            // =====================
-            }
-        }
+         // 3.A Отрисовка Pending окон (висят в центре)
+         for (const auto& pw : localPending) {
+             if (!IsWindow(pw.hwnd)) continue;
+             ops.push_back({pw.hwnd, screenCx - pw.width / 2, screenCy - pw.height / 2, pw.width, pw.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
+         }
+
+         // 3.B Отрисовка анимации сетки
+         if (localGridActive) {
+             auto animNow = std::chrono::steady_clock::now();
+             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(animNow - g_gridAnim.startTime).count();
+             float t = std::min(1.0f, (float)ms / g_gridAnim.durationMs);
+             float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t);
+
+             for (const auto& item : localGridItems) {
+                 if (!IsWindow(item.hwnd)) continue;
+                 int curX = (int)(item.startX + (item.endX - item.startX) * ease);
+                 int curY = (int)(item.startY + (item.endY - item.startY) * ease);
+                 ops.push_back({item.hwnd, curX, curY, item.width, item.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
+             }
+
+             if (t >= 1.0f) {
+                 EnterCriticalSection(&g_lock);
+                 g_gridAnim.active = false;
+                 for (const auto& item : g_gridAnim.items) {
+                     if (!IsWindow(item.hwnd)) continue;
+                     bool exists = false;
+                     for (const auto& s : g_snapshots) {
+                         if (s.hwnd == item.hwnd) { exists = true; break; }
+                     }
+                     if (!exists) {
+                         int relativeX = item.endX - g_camOffset.x;
+                         int relativeY = item.endY - g_camOffset.y;
+                         g_snapshots.push_back({item.hwnd, relativeX, relativeY, item.width, item.height});
+                     }
+                     auto it = std::find(g_newWindowsFound.begin(), g_newWindowsFound.end(), item.hwnd);
+                     if (it != g_newWindowsFound.end()) {
+                         g_newWindowsFound.erase(it);
+                     }
+                 }
+                 g_gridAnim.items.clear();
+                 LeaveCriticalSection(&g_lock);
+             }
+         }
+
+         // 3.C Обработка перетаскивания (delta-accumulation)
+         bool cameraMoved = false; // Флаг: камера реально сдвинулась в этом кадре
+
+         // ВАЖНО: Проверяем g_isDragging напрямую, а не через localDrag
+         // Это предотвращает применение дельты после отпускания кнопки
+         if (g_isDragging.load() && !g_gridAnim.active) {
+             // Атомарно извлекаем накопленную дельту (exchange обнуляет аккумулятор)
+             long dx = g_mouseDeltaX.exchange(0, std::memory_order_relaxed);
+             long dy = g_mouseDeltaY.exchange(0, std::memory_order_relaxed);
+
+             // Применяем дельту ТОЛЬКО если она ненулевая
+             if (dx != 0 || dy != 0) {
+                 EnterCriticalSection(&g_lock);
+                 // ВАЖНО: Инвертируем дельту! Мышь вправо → камера влево
+                 // Это создает эффект "тяги" контента за курсором
+                 int newX = g_camOffset.x + (int)dx;
+                 int newY = g_camOffset.y + (int)dy;
+                 g_camOffset.x = std::max(-5000, std::min(newX, CANVAS_WIDTH + 5000));
+                 g_camOffset.y = std::max(-5000, std::min(newY, CANVAS_HEIGHT + 5000));
+                 localCamOffset = g_camOffset;
+                 LeaveCriticalSection(&g_lock);
+                 cameraMoved = true; // Камера сдвинулась!
+             }
+         }
+
+         // 3.D Отрисовка обычных окон (если не идет анимация сетки)
+         if (!localGridActive) {
+             // Двигаем окна ТОЛЬКО если камера реально сдвинулась или идет анимация
+             if (cameraMoved || localCamAnim) {
+                 for (auto& s : localSnapshots) {
+                     if (!IsWindow(s.hwnd)) continue;
+
+                     int targetX = s.baseX + localCamOffset.x;
+                     int targetY = s.baseY + localCamOffset.y;
+
+                     // Ограничиваем координаты
+                     targetX = std::max(-5000, std::min(targetX, CANVAS_WIDTH + 5000));
+                     targetY = std::max(-5000, std::min(targetY, CANVAS_HEIGHT + 5000));
+
+                     // Двигаем окно без дополнительных проверок (для минимальной задержки)
+                     ops.push_back({s.hwnd, targetX, targetY, s.width, s.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
+                 }
+             }
+         }
 
         if (!ops.empty()) ApplyMoves(ops);
 
@@ -1177,7 +1193,7 @@ void FocusOnWindow(HWND target) {
 
 void StartDrag(POINT p) {
     if (g_gridAnim.active) return;
-    
+
     // 1. СИНХРОНИЗАЦИЯ: Обновляем координаты окон перед началом движения камеры
     EnterCriticalSection(&g_lock);
     for (auto& s : g_snapshots) {
@@ -1187,12 +1203,12 @@ void StartDrag(POINT p) {
                 // Получаем текущие экранные координаты
                 int realX = r.left;
                 int realY = r.top;
-                
+
                 // Вычисляем новые базовые координаты относительно текущего смещения камеры
                 // Формула: Base = Real - CameraOffset
                 s.baseX = realX - g_camOffset.x;
                 s.baseY = realY - g_camOffset.y;
-                
+
                 // Также на всякий случай обновляем размер, если окно изменилось
                 s.width = r.right - r.left;
                 s.height = r.bottom - r.top;
@@ -1201,11 +1217,15 @@ void StartDrag(POINT p) {
     }
     LeaveCriticalSection(&g_lock);
 
-    // 2. СТАРТ ДВИЖЕНИЯ
+    // 2. СТАРТ ДВИЖЕНИЯ - инициализация delta-accumulation
     g_isCamAnim.store(false);
     g_isDragging.store(true);
-    g_dragStartMouse = p;
-    g_currentMouse = p;
+    // g_panStartButton уже установлена в MouseHook перед вызовом StartDrag
+
+    // Инициализируем систему дельт
+    g_lastHookMousePos = p;
+    g_mouseDeltaX.store(0, std::memory_order_relaxed);
+    g_mouseDeltaY.store(0, std::memory_order_relaxed);
 }
 
 void Zoom(float scale) {
@@ -1280,44 +1300,74 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
     // 2. ГЛАВНАЯ ЛОГИКА: КОНЕЧНЫЙ АВТОМАТ
     // ========================================================================
 
-    // --- СОСТОЯНИЕ 1: МЫ УЖЕ ТАЩИМ (DRAG ACTIVE) ---
-    if (g_isDragging.load()) {
-        // А. Обновляем координаты для рабочего потока
-        if (!g_gridAnim.active) {
-            g_currentMouse = m->pt;
-        }
+     // --- СОСТОЯНИЕ 1: МЫ УЖЕ ТАЩИМ (DRAG ACTIVE) ---
+     if (g_isDragging.load()) {
+         // А. Накапливаем дельту движения мыши (только на WM_MOUSEMOVE)
+         if (wParam == WM_MOUSEMOVE) {
+             // Вычисляем дельту относительно последней обработанной позиции
+             long dx = m->pt.x - g_lastHookMousePos.x;
+             long dy = m->pt.y - g_lastHookMousePos.y;
 
-        // Б. Проверяем, отпустили ли мы ТУ САМУЮ кнопку, которой начали тянуть
-        bool isStopEvent = false;
-        WPARAM startBtn = g_panStartButton.load();
+             // Атомарно добавляем в аккумулятор
+             g_mouseDeltaX.fetch_add(dx, std::memory_order_relaxed);
+             g_mouseDeltaY.fetch_add(dy, std::memory_order_relaxed);
 
-        if (wParam == WM_LBUTTONUP && startBtn == VK_LBUTTON) isStopEvent = true;
-        else if (wParam == WM_RBUTTONUP && startBtn == VK_RBUTTON) isStopEvent = true;
-        else if (wParam == WM_MBUTTONUP && startBtn == VK_MBUTTON) isStopEvent = true;
-        else if (wParam == WM_XBUTTONUP) {
-            WORD xBtn = HIWORD(m->mouseData);
-            if ((startBtn == VK_XBUTTON1 && xBtn == XBUTTON1) || 
-                (startBtn == VK_XBUTTON2 && xBtn == XBUTTON2)) {
-                isStopEvent = true;
-            }
-        }
+             // Обновляем последнюю позицию
+             g_lastHookMousePos = m->pt;
+         }
 
-        // В. Если отпустили "ту самую" кнопку -> ЗАВЕРШАЕМ
-        if (isStopEvent) {
-            g_isDragging.store(false);
-            g_panStartButton.store(0);
-            return 1; // БЛОКИРУЕМ событие
-        }
+         // Б. Проверяем, отпустили ли мы ТУ САМУЮ кнопку, которой начали тянуть
+         bool isStopEvent = false;
+         WPARAM startBtn = g_panStartButton.load();
 
-        // Г. Блокируем любые другие нажатия/отпускания во время драга
-        if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN ||
-            wParam == WM_LBUTTONUP || wParam == WM_RBUTTONUP || wParam == WM_MBUTTONUP || wParam == WM_XBUTTONUP) {
-            return 1;
-        }
+         if (wParam == WM_LBUTTONUP && startBtn == VK_LBUTTON) isStopEvent = true;
+         else if (wParam == WM_RBUTTONUP && startBtn == VK_RBUTTON) isStopEvent = true;
+         else if (wParam == WM_MBUTTONUP && startBtn == VK_MBUTTON) isStopEvent = true;
+         else if (wParam == WM_XBUTTONUP) {
+             WORD xBtn = HIWORD(m->mouseData);
+             if ((startBtn == VK_XBUTTON1 && xBtn == XBUTTON1) || 
+                 (startBtn == VK_XBUTTON2 && xBtn == XBUTTON2)) {
+                 isStopEvent = true;
+             }
+         }
 
-        // Д. Пропускаем движение мыши и колесо
-        return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
-    }
+         // В. Если отпустили "ту самую" кнопку -> ЗАВЕРШАЕМ
+         if (isStopEvent) {
+             // Обнуляем аккумулятор дельт (важно!)
+             g_mouseDeltaX.store(0, std::memory_order_relaxed);
+             g_mouseDeltaY.store(0, std::memory_order_relaxed);
+
+             // Обновляем снапшоты окон с новыми позициями
+             EnterCriticalSection(&g_lock);
+             for (auto& s : g_snapshots) {
+                 if (IsWindow(s.hwnd)) {
+                     RECT r;
+                     if (GetWindowRect(s.hwnd, &r)) {
+                         s.baseX = r.left - g_camOffset.x;
+                         s.baseY = r.top - g_camOffset.y;
+                         s.width = r.right - r.left;
+                         s.height = r.bottom - r.top;
+                     }
+                 }
+             }
+             LeaveCriticalSection(&g_lock);
+
+             g_isDragging.store(false);
+             g_panStartButton.store(0);
+
+             // НЕ блокируем событие отпускания - пропускаем его дальше
+             return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+         }
+
+         // Г. Блокируем любые другие нажатия/отпускания во время драга
+         if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN ||
+             wParam == WM_LBUTTONUP || wParam == WM_RBUTTONUP || wParam == WM_MBUTTONUP || wParam == WM_XBUTTONUP) {
+             return 1;
+         }
+
+         // Д. Пропускаем движение мыши и колесо
+         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+     }
 
     // --- СОСТОЯНИЕ 2: МЫ НЕ ТАЩИМ (IDLE) -> ПРОВЕРЯЕМ ЗАПУСК ---
     
@@ -1466,6 +1516,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (g_worker.joinable()) g_worker.join();
         DeleteCriticalSection(&g_lock);
         DeleteCriticalSection(&g_debugLock);
+
+        // Освобождаем мьютекс единственного экземпляра
+        if (g_hSingleInstanceMutex) {
+            CloseHandle(g_hSingleInstanceMutex);
+            g_hSingleInstanceMutex = NULL;
+        }
+
         PostQuitMessage(0);
         return 0;
     }
