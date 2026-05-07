@@ -1,5 +1,4 @@
 #include <windows.h>
-#include <dwmapi.h>
 #include <vector>
 #include <algorithm>
 #include <atomic>
@@ -11,7 +10,6 @@
 #include <iomanip>
 #include <shlobj.h>
 #include <cstdio>
-#pragma comment(lib, "dwmapi.lib")
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -101,18 +99,8 @@ const int GRID_ANIM_DURATION = 600; // Длительность анимации
 // ═══════════════════════════════════════════════════════════════════════════════
 struct WindowSnapshot {
     HWND hwnd;
-    int  baseX, baseY;
+    int  baseX, baseY; 
     int  width, height;
-
-    // DWM Thumbnail поля
-    bool isThumbnail;       // Сейчас в режиме thumbnail?
-    HWND proxyHwnd;         // Прокси-окно (NULL если нет)
-    HTHUMBNAIL hThumb;      // DWM thumbnail handle
-    int hiddenX, hiddenY;   // Где спрятан оригинал
-
-    WindowSnapshot() : hwnd(NULL), baseX(0), baseY(0), width(0), height(0),
-                       isThumbnail(false), proxyHwnd(NULL), hThumb(NULL),
-                       hiddenX(0), hiddenY(0) {}
 };
 
 struct WindowMoveOp {
@@ -205,20 +193,12 @@ void ActivateExistingInstance() {
 // ═════════════════════════════════════════════════════════════════════════════════
 std::atomic<bool> g_isDragging(false);
 std::atomic<WPARAM> g_panStartButton = 0; // Запоминаем, какая кнопка начала тягу (VK_MBUTTON, VK_LBUTTON и т.д.)
-std::atomic<HWND> g_pendingProxyClick(NULL); // Прокси-окно, на которое кликнули (для отложенной обработки)
-
-// Отслеживание двойного клика на прокси
-HWND g_lastClickedProxy = NULL;
-DWORD g_lastProxyClickTime = 0;
-const DWORD PROXY_DBLCLICK_TIMEOUT = 500; // мс
-
 std::vector<WindowSnapshot> g_snapshots;
 std::vector<HWND> g_newWindowsFound; // Нееповторяющийся буфер новых окон
 std::wstring g_newWindowNotice;
 CRITICAL_SECTION g_lock;
 std::thread g_worker;
 std::atomic<bool> g_stop(false);
-std::atomic<bool> g_isZooming(false); // Защита от одновременного выполнения Zoom
 
 // Delta-accumulation для плавного перетаскивания
 std::atomic<long> g_mouseDeltaX{0};
@@ -471,12 +451,6 @@ void ArrangeGrid();
 void TakeSnapshot();
 void FocusOnWindow(HWND target);
 
-// DWM Thumbnail функции
-bool CreateThumbnailProxy(WindowSnapshot& snap);
-void DestroyThumbnailProxy(WindowSnapshot& snap, bool restoreToProxyPosition = true);
-void UpdateThumbnailSize(WindowSnapshot& snap);
-void HandleProxyClick(WindowSnapshot& snap);
-
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ЛОГИКА
@@ -654,29 +628,15 @@ void ApplyMoves(const std::vector<WindowMoveOp>& ops) {
 void ArrangeGrid() {
     std::vector<WindowSnapshot> list;
     list.reserve(64);
-
-    EnterCriticalSection(&g_lock);
-
-    // 1. Используем существующие снимки из g_snapshots
-    // Если окно в thumbnail режиме - используем прокси, иначе оригинал
-    for (const auto& s : g_snapshots) {
-        HWND targetHwnd = s.isThumbnail ? s.proxyHwnd : s.hwnd;
-
-        if (!IsWindow(targetHwnd)) continue;
-
-        RECT r;
-        if (!GetWindowRect(targetHwnd, &r)) continue;
-
-        WindowSnapshot snap = s; // Копируем существующий снимок
-        snap.baseX = r.left;     // Обновляем текущие координаты для старта анимации
-        snap.baseY = r.top;
-        snap.width = r.right - r.left;
-        snap.height = r.bottom - r.top;
-
-        list.push_back(snap);
-    }
-
-    LeaveCriticalSection(&g_lock);
+    
+    // 1. Сбор окон (берем текущие реальные координаты для старта анимации)
+    EnumWindows([](HWND h, LPARAM l) -> BOOL {
+        if (!IsValidWnd(h)) return TRUE;
+        RECT r; GetWindowRect(h, &r);
+        auto* v = (std::vector<WindowSnapshot>*)l;
+        v->push_back({h, r.left, r.top, r.right-r.left, r.bottom-r.top});
+        return TRUE;
+    }, (LPARAM)&list);
 
     if (list.empty()) return;
 
@@ -772,18 +732,17 @@ void ArrangeGrid() {
     // 5. Формирование анимации
     for (size_t i = 0; i < list.size(); ++i) {
         GridAnimItem item;
-        // Используем прокси если окно в thumbnail режиме
-        item.hwnd = list[i].isThumbnail ? list[i].proxyHwnd : list[i].hwnd;
-        item.startX = list[i].baseX;
+        item.hwnd = list[i].hwnd;
+        item.startX = list[i].baseX; 
         item.startY = list[i].baseY;
-
+        
         // Применяем смещение
         item.endX = finalPositions[i].x + offsetX;
         item.endY = finalPositions[i].y + offsetY;
-
+        
         item.width = list[i].width;
         item.height = list[i].height;
-
+        
         g_gridAnim.items.push_back(item);
     }
 
@@ -806,18 +765,7 @@ void TakeSnapshot() {
         if (!IsValidWnd(h)) return TRUE;
         RECT r; GetWindowRect(h, &r);
         auto* c = (SnapshotCtx*)l;
-        WindowSnapshot snap;
-        snap.hwnd = h;
-        snap.baseX = r.left - c->offset.x;
-        snap.baseY = r.top - c->offset.y;
-        snap.width = r.right - r.left;
-        snap.height = r.bottom - r.top;
-        snap.isThumbnail = false;
-        snap.proxyHwnd = NULL;
-        snap.hThumb = NULL;
-        snap.hiddenX = 0;
-        snap.hiddenY = 0;
-        c->list->push_back(snap);
+        c->list->push_back({h, r.left - c->offset.x, r.top - c->offset.y, r.right-r.left, r.bottom-r.top});
         return TRUE;
     }, (LPARAM)&ctx);
     LeaveCriticalSection(&g_lock);
@@ -909,25 +857,10 @@ POINT CalculateCameraTarget(int targetAbsX, int targetAbsY, int width, int heigh
 void WorkerFunc() {
     auto lastWindowScan = std::chrono::steady_clock::now();
     auto lastDebugUpdate = std::chrono::steady_clock::now();
-
+    
       while (!g_stop.load()) {
           bool camAnim = g_isCamAnim.load();
           bool gridAnim = g_gridAnim.active;
-
-        // ============================================================
-        // 0. ОБРАБОТКА ОТЛОЖЕННОГО КЛИКА НА ПРОКСИ
-        // ============================================================
-        HWND pendingProxy = g_pendingProxyClick.exchange(NULL);
-        if (pendingProxy != NULL) {
-            EnterCriticalSection(&g_lock);
-            for (auto& s : g_snapshots) {
-                if (s.isThumbnail && s.proxyHwnd == pendingProxy) {
-                    HandleProxyClick(s);
-                    break;
-                }
-            }
-            LeaveCriticalSection(&g_lock);
-        }
 
         // ============================================================
         // 1. ПЕРИОДИЧЕСКОЕ СКАНИРОВАНИЕ НОВЫХ ОКОН (Раз в 1 сек)
@@ -1145,45 +1078,17 @@ void WorkerFunc() {
              if (t >= 1.0f) {
                  EnterCriticalSection(&g_lock);
                  g_gridAnim.active = false;
-
-                 // Обновляем позиции существующих снимков после завершения анимации
                  for (const auto& item : g_gridAnim.items) {
                      if (!IsWindow(item.hwnd)) continue;
-
-                     // Ищем соответствующий снимок
-                     // item.hwnd может быть либо оригиналом, либо прокси
-                     bool found = false;
-                     for (auto& s : g_snapshots) {
-                         HWND targetHwnd = s.isThumbnail ? s.proxyHwnd : s.hwnd;
-                         if (targetHwnd == item.hwnd) {
-                             // Обновляем базовые координаты
-                             s.baseX = item.endX - g_camOffset.x;
-                             s.baseY = item.endY - g_camOffset.y;
-                             s.width = item.width;
-                             s.height = item.height;
-                             found = true;
-                             break;
-                         }
+                     bool exists = false;
+                     for (const auto& s : g_snapshots) {
+                         if (s.hwnd == item.hwnd) { exists = true; break; }
                      }
-
-                     // Если не нашли (новое окно) - добавляем
-                     if (!found) {
+                     if (!exists) {
                          int relativeX = item.endX - g_camOffset.x;
                          int relativeY = item.endY - g_camOffset.y;
-                         WindowSnapshot newSnap;
-                         newSnap.hwnd = item.hwnd;
-                         newSnap.baseX = relativeX;
-                         newSnap.baseY = relativeY;
-                         newSnap.width = item.width;
-                         newSnap.height = item.height;
-                         newSnap.isThumbnail = false;
-                         newSnap.proxyHwnd = NULL;
-                         newSnap.hThumb = NULL;
-                         newSnap.hiddenX = 0;
-                         newSnap.hiddenY = 0;
-                         g_snapshots.push_back(newSnap);
+                         g_snapshots.push_back({item.hwnd, relativeX, relativeY, item.width, item.height});
                      }
-
                      auto it = std::find(g_newWindowsFound.begin(), g_newWindowsFound.end(), item.hwnd);
                      if (it != g_newWindowsFound.end()) {
                          g_newWindowsFound.erase(it);
@@ -1219,15 +1124,15 @@ void WorkerFunc() {
              }
          }
 
-         // 3.E Отрисовка обычных окон (если не идет анимация сетки)
+         // 3.D Отрисовка обычных окон (если не идет анимация сетки)
          if (!localGridActive) {
              // Двигаем окна ТОЛЬКО если камера реально сдвинулась или идет анимация
              if (cameraMoved || localCamAnim) {
+                 // КРИТИЧНО: Валидируем каждое окно перед использованием
+                 // localSnapshots — это копия, но окна могли закрыться между копированием и использованием
                  for (auto& s : localSnapshots) {
-                     // Если окно в thumbnail режиме - двигаем прокси, иначе оригинал
-                     HWND targetHwnd = s.isThumbnail ? s.proxyHwnd : s.hwnd;
-
-                     if (!IsWindow(targetHwnd)) continue;
+                     // ЗАЩИТА: Проверяем существование окна ПЕРЕД использованием
+                     if (!s.hwnd || !IsWindow(s.hwnd)) continue;
 
                      int targetX = s.baseX + localCamOffset.x;
                      int targetY = s.baseY + localCamOffset.y;
@@ -1237,7 +1142,7 @@ void WorkerFunc() {
                      targetY = std::max(-5000, std::min(targetY, CANVAS_HEIGHT + 5000));
 
                      // Двигаем окно без дополнительных проверок (для минимальной задержки)
-                     ops.push_back({targetHwnd, targetX, targetY, s.width, s.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
+                     ops.push_back({s.hwnd, targetX, targetY, s.width, s.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
                  }
              }
          }
@@ -1319,12 +1224,9 @@ void StartDrag(POINT p) {
     // 1. СИНХРОНИЗАЦИЯ: Обновляем координаты окон перед началом движения камеры
     EnterCriticalSection(&g_lock);
     for (auto& s : g_snapshots) {
-        // Если окно в thumbnail режиме - берем координаты прокси, иначе оригинала
-        HWND targetHwnd = s.isThumbnail ? s.proxyHwnd : s.hwnd;
-
-        if (IsWindow(targetHwnd)) {
+        if (IsWindow(s.hwnd)) {
             RECT r;
-            if (GetWindowRect(targetHwnd, &r)) {
+            if (GetWindowRect(s.hwnd, &r)) {
                 // Получаем текущие экранные координаты
                 int realX = r.left;
                 int realY = r.top;
@@ -1353,273 +1255,6 @@ void StartDrag(POINT p) {
     g_mouseDeltaY.store(0, std::memory_order_relaxed);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// DWM THUMBNAIL ФУНКЦИИ
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// Создание прокси-окна с thumbnail
-bool CreateThumbnailProxy(WindowSnapshot& snap) {
-    if (snap.isThumbnail || !IsWindow(snap.hwnd)) return false;
-
-    // Получаем текущую позицию оригинального окна
-    RECT originalRect;
-    if (!GetWindowRect(snap.hwnd, &originalRect)) return false;
-
-    int origWidth = originalRect.right - originalRect.left;
-    int origHeight = originalRect.bottom - originalRect.top;
-
-    // Проверка минимального размера
-    if (origWidth < 50 || origHeight < 50) return false;
-
-    // Прячем оригинальное окно далеко за пределы экрана (влево и вверх)
-    snap.hiddenX = -10000;
-    snap.hiddenY = -5000;
-    SetWindowPos(snap.hwnd, NULL, snap.hiddenX, snap.hiddenY, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-
-    // Создаём прокси-окно (borderless, resizable)
-    // Используем координаты на канвасе с учетом камеры
-    int proxyX = snap.baseX + g_camOffset.x;
-    int proxyY = snap.baseY + g_camOffset.y;
-
-    HINSTANCE hInst = GetModuleHandle(NULL);
-    snap.proxyHwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_LAYERED,
-        L"WCWMProxyWindow",  // Используем отдельный класс
-        L"",
-        WS_POPUP,
-        proxyX, proxyY,
-        snap.width, snap.height,
-        NULL, NULL, hInst, NULL
-    );
-
-    if (!snap.proxyHwnd) {
-        // Возвращаем оригинал на место
-        SetWindowPos(snap.hwnd, NULL, originalRect.left, originalRect.top, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        return false;
-    }
-
-    SetLayeredWindowAttributes(snap.proxyHwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
-    ShowWindow(snap.proxyHwnd, SW_SHOW);
-
-    // Создаём DWM thumbnail
-    HRESULT hr = DwmRegisterThumbnail(snap.proxyHwnd, snap.hwnd, &snap.hThumb);
-    if (FAILED(hr)) {
-        DestroyWindow(snap.proxyHwnd);
-        snap.proxyHwnd = NULL;
-        // Возвращаем оригинал
-        SetWindowPos(snap.hwnd, NULL, originalRect.left, originalRect.top, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        return false;
-    }
-
-    // Получаем размер исходного окна для правильного aspect ratio
-    SIZE sourceSize;
-    hr = DwmQueryThumbnailSourceSize(snap.hThumb, &sourceSize);
-    if (FAILED(hr)) {
-        sourceSize.cx = snap.width;
-        sourceSize.cy = snap.height;
-    }
-
-    // Проверка на нулевой размер
-    if (sourceSize.cx <= 0 || sourceSize.cy <= 0) {
-        sourceSize.cx = snap.width;
-        sourceSize.cy = snap.height;
-    }
-
-    // Вычисляем правильное соотношение сторон
-    float sourceAspect = (float)sourceSize.cx / (float)sourceSize.cy;
-    float proxyAspect = (float)snap.width / (float)snap.height;
-
-    int destWidth = snap.width;
-    int destHeight = snap.height;
-
-    if (sourceAspect > proxyAspect) {
-        destHeight = (int)(snap.width / sourceAspect);
-    } else {
-        destWidth = (int)(snap.height * sourceAspect);
-    }
-
-    // Проверка на нулевой размер после вычислений
-    if (destWidth <= 0) destWidth = snap.width;
-    if (destHeight <= 0) destHeight = snap.height;
-
-    // Центрируем thumbnail внутри прокси-окна
-    int offsetX = (snap.width - destWidth) / 2;
-    int offsetY = (snap.height - destHeight) / 2;
-
-    // Настраиваем thumbnail
-    DWM_THUMBNAIL_PROPERTIES props = {};
-    props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
-    props.rcDestination = {offsetX, offsetY, offsetX + destWidth, offsetY + destHeight};
-    props.opacity = 255;
-    props.fVisible = TRUE;
-    props.fSourceClientAreaOnly = TRUE;
-
-    hr = DwmUpdateThumbnailProperties(snap.hThumb, &props);
-    if (FAILED(hr)) {
-        DwmUnregisterThumbnail(snap.hThumb);
-        snap.hThumb = NULL;
-        DestroyWindow(snap.proxyHwnd);
-        snap.proxyHwnd = NULL;
-        SetWindowPos(snap.hwnd, NULL, originalRect.left, originalRect.top, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        return false;
-    }
-
-    snap.isThumbnail = true;
-    return true;
-}
-
-// Удаление прокси и возврат оригинала
-void DestroyThumbnailProxy(WindowSnapshot& snap, bool restoreToProxyPosition) {
-    if (!snap.isThumbnail) return;
-
-    // Получаем позицию прокси перед удалением
-    RECT proxyRect = {};
-    if (snap.proxyHwnd && IsWindow(snap.proxyHwnd)) {
-        GetWindowRect(snap.proxyHwnd, &proxyRect);
-    }
-
-    // Удаляем thumbnail
-    if (snap.hThumb) {
-        DwmUnregisterThumbnail(snap.hThumb);
-        snap.hThumb = NULL;
-    }
-
-    // Удаляем прокси-окно
-    if (snap.proxyHwnd && IsWindow(snap.proxyHwnd)) {
-        ShowWindow(snap.proxyHwnd, SW_HIDE);  // Сначала скрываем
-        DestroyWindow(snap.proxyHwnd);        // Потом удаляем
-
-        // Принудительно обрабатываем сообщения для завершения удаления
-        MSG msg;
-        while (PeekMessage(&msg, snap.proxyHwnd, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-
-        snap.proxyHwnd = NULL;
-    }
-
-    // Возвращаем оригинальное окно
-    if (IsWindow(snap.hwnd)) {
-        if (restoreToProxyPosition) {
-            SetWindowPos(snap.hwnd, NULL,
-                        proxyRect.left, proxyRect.top,
-                        snap.width, snap.height,
-                        SWP_NOZORDER | SWP_NOACTIVATE);
-
-            // Обновляем baseX/baseY для оригинала
-            snap.baseX = proxyRect.left - g_camOffset.x;
-            snap.baseY = proxyRect.top - g_camOffset.y;
-        }
-    }
-
-    snap.isThumbnail = false;
-}
-
-// Обновление размера thumbnail при ресайзе прокси
-void UpdateThumbnailSize(WindowSnapshot& snap) {
-    if (!snap.isThumbnail || !snap.hThumb || !snap.proxyHwnd) return;
-
-    RECT proxyRect;
-    if (!GetWindowRect(snap.proxyHwnd, &proxyRect)) return;
-
-    int width = proxyRect.right - proxyRect.left;
-    int height = proxyRect.bottom - proxyRect.top;
-
-    // Обновляем размер в snapshot
-    snap.width = width;
-    snap.height = height;
-
-    // Получаем размер исходного окна
-    SIZE sourceSize;
-    HRESULT hr = DwmQueryThumbnailSourceSize(snap.hThumb, &sourceSize);
-    if (FAILED(hr)) {
-        DWM_THUMBNAIL_PROPERTIES props = {};
-        props.dwFlags = DWM_TNP_RECTDESTINATION;
-        props.rcDestination = {0, 0, width, height};
-        DwmUpdateThumbnailProperties(snap.hThumb, &props);
-        return;
-    }
-
-    // Вычисляем правильное соотношение сторон
-    float sourceAspect = (float)sourceSize.cx / (float)sourceSize.cy;
-    float proxyAspect = (float)width / (float)height;
-
-    int destWidth = width;
-    int destHeight = height;
-
-    if (sourceAspect > proxyAspect) {
-        destHeight = (int)(width / sourceAspect);
-    } else {
-        destWidth = (int)(height * sourceAspect);
-    }
-
-    // Центрируем thumbnail внутри прокси-окна
-    int offsetX = (width - destWidth) / 2;
-    int offsetY = (height - destHeight) / 2;
-
-    DWM_THUMBNAIL_PROPERTIES props = {};
-    props.dwFlags = DWM_TNP_RECTDESTINATION;
-    props.rcDestination = {offsetX, offsetY, offsetX + destWidth, offsetY + destHeight};
-
-    DwmUpdateThumbnailProperties(snap.hThumb, &props);
-
-    // Обновляем размер оригинального окна (синхронизация пропорций)
-    if (IsWindow(snap.hwnd)) {
-        SetWindowPos(snap.hwnd, NULL, 0, 0, width, height,
-                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-}
-
-// Обработка клика на прокси - возврат оригинала с resize до 350x350
-void HandleProxyClick(WindowSnapshot& snap) {
-    if (!snap.isThumbnail) return;
-
-    // Получаем позицию прокси
-    RECT proxyRect = {};
-    if (snap.proxyHwnd && IsWindow(snap.proxyHwnd)) {
-        GetWindowRect(snap.proxyHwnd, &proxyRect);
-    }
-
-    // Удаляем прокси
-    DestroyThumbnailProxy(snap, false);
-
-    // Вычисляем новый размер 350x350 с сохранением пропорций
-    // Меньшая сторона = 350px
-    int newWidth, newHeight;
-    if (snap.width < snap.height) {
-        // Ширина меньше - она становится 350
-        newWidth = 350;
-        newHeight = (int)(350.0f * snap.height / snap.width);
-    } else {
-        // Высота меньше - она становится 350
-        newHeight = 350;
-        newWidth = (int)(350.0f * snap.width / snap.height);
-    }
-
-    // Обновляем snapshot
-    snap.width = newWidth;
-    snap.height = newHeight;
-
-    // Возвращаем оригинал на место прокси с новым размером
-    if (IsWindow(snap.hwnd)) {
-        SetWindowPos(snap.hwnd, NULL,
-                    proxyRect.left, proxyRect.top,
-                    newWidth, newHeight,
-                    SWP_NOZORDER | SWP_NOACTIVATE);
-
-        // Обновляем baseX/baseY
-        EnterCriticalSection(&g_lock);
-        snap.baseX = proxyRect.left - g_camOffset.x;
-        snap.baseY = proxyRect.top - g_camOffset.y;
-        LeaveCriticalSection(&g_lock);
-    }
-}
-
 // Проверка лимитов масштабирования
 bool CheckScaleLimits(int width, int height) {
     // Минимум: любая сторона должна быть >= 100px
@@ -1641,12 +1276,6 @@ bool CheckScaleLimits(int width, int height) {
 void Zoom(float scale) {
     if (g_gridAnim.active) return;
 
-    // Защита от одновременного выполнения
-    bool expected = false;
-    if (!g_isZooming.compare_exchange_strong(expected, true)) {
-        return; // Zoom уже выполняется, пропускаем
-    }
-
     EnterCriticalSection(&g_lock);
     POINT center = {GetSystemMetrics(SM_CXSCREEN)/2, GetSystemMetrics(SM_CYSCREEN)/2};
     if (g_snapshots.empty()) { LeaveCriticalSection(&g_lock); return; }
@@ -1654,10 +1283,6 @@ void Zoom(float scale) {
     ops.reserve(g_snapshots.size());
     for (auto& s : g_snapshots) {
         if (!IsWindow(s.hwnd)) continue;
-
-        // Сохраняем старые размеры для правильного вычисления позиции
-        int oldWidth = s.width;
-        int oldHeight = s.height;
 
         // Вычисляем новый размер с сохранением пропорций
         int nw = (int)(s.width * scale);
@@ -1668,61 +1293,20 @@ void Zoom(float scale) {
             continue;
         }
 
-        // Проверяем нужно ли переключиться на thumbnail или обратно
-        bool shouldUseThumbnail = (nw < 300 || nh < 300);
-
-        if (shouldUseThumbnail && !s.isThumbnail) {
-            // Создаём thumbnail с текущими размерами (до масштабирования)
-            CreateThumbnailProxy(s);
-
-            // Если создание не удалось, продолжаем с оригиналом
-            if (!s.isThumbnail) {
-                // Thumbnail не создался, работаем с оригиналом
-            }
-        } else if (!shouldUseThumbnail && s.isThumbnail) {
-            // Нужно удалить thumbnail и вернуть оригинал
-            // Вычисляем где должен быть оригинал (на месте прокси)
-            int targetX = s.baseX + g_camOffset.x;
-            int targetY = s.baseY + g_camOffset.y;
-
-            DestroyThumbnailProxy(s, false);
-
-            // Вручную возвращаем оригинал на место прокси
-            if (IsWindow(s.hwnd)) {
-                SetWindowPos(s.hwnd, NULL,
-                            targetX, targetY,
-                            0, 0,
-                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                // baseX/baseY уже правильные, не нужно обновлять
-            }
-        }
-
-        // Масштабируем относительно центра экрана, используя СТАРЫЕ размеры
+        // Масштабируем относительно центра экрана
         int physX = s.baseX + g_camOffset.x;
         int physY = s.baseY + g_camOffset.y;
-        int ncx = center.x + (int)((physX + oldWidth/2 - center.x) * scale);
-        int ncy = center.y + (int)((physY + oldHeight/2 - center.y) * scale);
+        int ncx = center.x + (int)((physX + s.width/2 - center.x) * scale);
+        int ncy = center.y + (int)((physY + s.height/2 - center.y) * scale);
 
-        // Определяем какое окно двигать
-        HWND targetHwnd = s.isThumbnail ? s.proxyHwnd : s.hwnd;
-        if (!IsWindow(targetHwnd)) continue;
-
-        ops.push_back({targetHwnd, ncx - nw/2, ncy - nh/2, nw, nh, SWP_NOZORDER|SWP_NOACTIVATE});
+        ops.push_back({s.hwnd, ncx - nw/2, ncy - nh/2, nw, nh, SWP_NOZORDER|SWP_NOACTIVATE});
         s.baseX = (ncx - nw/2) - g_camOffset.x;
         s.baseY = (ncy - nh/2) - g_camOffset.y;
         s.width = nw;
         s.height = nh;
-
-        // Если это thumbnail - обновляем его размер
-        if (s.isThumbnail) {
-            UpdateThumbnailSize(s);
-        }
     }
     LeaveCriticalSection(&g_lock);
     ApplyMoves(ops);
-
-    // Сбрасываем флаг защиты
-    g_isZooming.store(false);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1891,42 +1475,6 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
     }
 
     // ========================================================================
-    // 2.5. ОБРАБОТКА ДВОЙНОГО КЛИКА НА ПРОКСИ-ОКНА
-    // ========================================================================
-    if (wParam == WM_LBUTTONDOWN) {
-        HWND clickedWindow = WindowFromPoint(m->pt);
-        if (clickedWindow) {
-            // Проверяем, является ли это прокси-окном
-            bool isProxy = false;
-            EnterCriticalSection(&g_lock);
-            for (auto& s : g_snapshots) {
-                if (s.isThumbnail && s.proxyHwnd == clickedWindow) {
-                    isProxy = true;
-                    break;
-                }
-            }
-            LeaveCriticalSection(&g_lock);
-
-            if (isProxy) {
-                DWORD now = GetTickCount();
-                // Проверяем двойной клик
-                if (g_lastClickedProxy == clickedWindow &&
-                    (now - g_lastProxyClickTime) < PROXY_DBLCLICK_TIMEOUT) {
-                    // Двойной клик - отложенная обработка
-                    g_pendingProxyClick.store(clickedWindow);
-                    g_lastClickedProxy = NULL;
-                    g_lastProxyClickTime = 0;
-                    return 1; // Блокируем клик
-                } else {
-                    // Первый клик - запоминаем
-                    g_lastClickedProxy = clickedWindow;
-                    g_lastProxyClickTime = now;
-                }
-            }
-        }
-    }
-
-    // ========================================================================
     // 3. ОБРАБОТКА АКТИВАЦИИ (Зум и Фокус)
     // ========================================================================
     
@@ -2056,17 +1604,6 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int) {
     WNDCLASSEXW wcMain = {sizeof(wcMain)};
     wcMain.lpfnWndProc = WndProc; wcMain.hInstance = h; wcMain.lpszClassName = L"CanvasDesk";
     RegisterClassExW(&wcMain);
-
-    // Регистрируем класс для прокси-окон
-    WNDCLASSEXW wcProxy = {sizeof(wcProxy)};
-    wcProxy.lpfnWndProc = DefWindowProcW;
-    wcProxy.hInstance = h;
-    wcProxy.lpszClassName = L"WCWMProxyWindow";
-    wcProxy.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wcProxy.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    wcProxy.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
-    RegisterClassExW(&wcProxy);
-
     g_hwnd = CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"CanvasDesk", L"", WS_POPUP, 0,0,1,1, NULL,NULL,h,NULL);
     if (!g_hwnd) return 1;
     SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
@@ -2074,8 +1611,7 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int) {
 
     CreateDebugWindow(h);
     Sleep(100);
-    TakeSnapshot();  // Сначала собираем окна
-    ArrangeGrid();   // Потом расставляем их
+    ArrangeGrid();
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
