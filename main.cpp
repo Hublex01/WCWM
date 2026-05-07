@@ -640,70 +640,225 @@ void ArrangeGrid() {
 
     if (list.empty()) return;
 
-    // 2. Сортировка: самое большое окно должно быть первым (оно станет центром)
-    std::sort(list.begin(), list.end(), [](const WindowSnapshot& a, const WindowSnapshot& b) {
-        return (a.width * a.height) > (b.width * b.height);
+    int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
+    int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
+
+    // 2. Найти ближайшее окно к центру экрана (оно станет центральным)
+    size_t centerIdx = 0;
+    long long minDistSq = LLONG_MAX;
+    for (size_t i = 0; i < list.size(); ++i) {
+        int cx = list[i].baseX + list[i].width / 2;
+        int cy = list[i].baseY + list[i].height / 2;
+        long long distSq = 1LL * (cx - screenCx) * (cx - screenCx) + 
+                          1LL * (cy - screenCy) * (cy - screenCy);
+        if (distSq < minDistSq) {
+            minDistSq = distSq;
+            centerIdx = i;
+        }
+    }
+
+    // 3. Создаём отсортированный список: центральное первое, остальные по расстоянию от него
+    WindowSnapshot centerWindow = list[centerIdx];
+    int centerCx = centerWindow.baseX + centerWindow.width / 2;
+    int centerCy = centerWindow.baseY + centerWindow.height / 2;
+
+    // Создаём пары (окно, расстояние до центра)
+    struct WindowWithDist {
+        WindowSnapshot window;
+        long long distSq;
+    };
+    std::vector<WindowWithDist> others;
+    others.reserve(list.size() - 1);
+
+    for (size_t i = 0; i < list.size(); ++i) {
+        if (i == centerIdx) continue;
+        int cx = list[i].baseX + list[i].width / 2;
+        int cy = list[i].baseY + list[i].height / 2;
+        long long distSq = 1LL * (cx - centerCx) * (cx - centerCx) + 
+                          1LL * (cy - centerCy) * (cy - centerCy);
+        others.push_back({list[i], distSq});
+    }
+
+    // Сортируем по расстоянию
+    std::sort(others.begin(), others.end(), [](const WindowWithDist& a, const WindowWithDist& b) {
+        return a.distSq < b.distSq;
     });
 
+    // Собираем финальный список
+    std::vector<WindowSnapshot> sortedList;
+    sortedList.reserve(list.size());
+    sortedList.push_back(centerWindow);
+    for (const auto& wd : others) {
+        sortedList.push_back(wd.window);
+    }
+
+    // 4. Радиальная упаковка (Circle Packing)
+    const int GAP = 2;
     struct PlacedRect { int x, y, w, h; };
     std::vector<PlacedRect> placed;
     std::vector<POINT> finalPositions;
-    
-    EnterCriticalSection(&g_lock);
-    g_gridAnim.items.clear();
-    g_gridAnim.items.reserve(list.size());
 
-    // Вспомогательная лямбда для проверки пересечений
-    auto intersects = [&](int nx, int ny, int nw, int nh, const std::vector<PlacedRect>& currentPlaced) {
-        for (const auto& pr : currentPlaced) {
-            // Проверка: если НЕ пересекается, то продолжаем. Если пересекается - возвращаем true.
-            // Пересечение есть, если прямоугольники НАЛАГАЮТСЯ.
-            bool noOverlap = (nx + nw <= pr.x || nx >= pr.x + pr.w || 
-                              ny + nh <= pr.y || ny >= pr.y + pr.h);
-            if (!noOverlap) return true;
+    auto intersects = [&](int nx, int ny, int nw, int nh) -> bool {
+        for (const auto& pr : placed) {
+            if (!(nx + nw + GAP <= pr.x || nx >= pr.x + pr.w + GAP || 
+                  ny + nh + GAP <= pr.y || ny >= pr.y + pr.h + GAP)) {
+                return true;
+            }
         }
         return false;
     };
 
-    // 3. Пошаговая упаковка каждого окна
-    for (size_t i = 0; i < list.size(); ++i) {
-        int w = list[i].width;
-        int h = list[i].height;
+    EnterCriticalSection(&g_lock);
+    g_gridAnim.items.clear();
+    g_gridAnim.items.reserve(sortedList.size());
+
+    // 5. Размещение окон
+    for (size_t i = 0; i < sortedList.size(); ++i) {
+        int w = sortedList[i].width;
+        int h = sortedList[i].height;
         POINT bestPos = {0, 0};
-        long long minDistSq = -1;
 
         if (i == 0) {
-            // Первое окно — в центр координат (0,0)
+            // Центральное окно в центр координат
             bestPos = { -w/2, -h/2 };
         } else {
-            // Для остальных ищем лучшее место среди ВСЕХ уже размещенных окон
-            for (const auto& pr : placed) {
-                // Генерируем 4 кандидата вокруг текущего размещенного окна
-                std::vector<std::pair<int, int>> slots = {
-                    {pr.x + pr.w, pr.y},       // Справа
-                    {pr.x - w,       pr.y},    // Слева
-                    {pr.x,           pr.y + pr.h}, // Снизу
-                    {pr.x,           pr.y - h}     // Сверху
+            // Определяем, где окно находилось относительно центрального
+            int windowCx = sortedList[i].baseX + w / 2;
+            int windowCy = sortedList[i].baseY + h / 2;
+            
+            // Вектор от центра к окну (направление)
+            int dx = windowCx - centerCx;
+            int dy = windowCy - centerCy;
+            
+            // Находим центральное размещённое окно (первое в placed)
+            const auto& centerPlaced = placed[0];
+            int centerPlacedCx = centerPlaced.x + centerPlaced.w / 2;
+            int centerPlacedCy = centerPlaced.y + centerPlaced.h / 2;
+            
+            // Пробуем позиции вокруг центрального окна в порядке приоритета
+            // на основе направления, где окно находилось
+            std::vector<std::pair<int, int>> slots;
+            
+            // Определяем приоритетное направление
+            bool isRight = dx > 0;
+            bool isLeft = dx < 0;
+            bool isBottom = dy > 0;
+            bool isTop = dy < 0;
+            
+            // Генерируем слоты в порядке приоритета
+            if (isRight && isBottom) {
+                // Правый нижний квадрант
+                slots = {
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y},  // Справа
+                    {centerPlaced.x, centerPlaced.y + centerPlaced.h + GAP},  // Снизу
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y + centerPlaced.h + GAP}, // Правый нижний угол
+                    {centerPlaced.x - w - GAP, centerPlaced.y},               // Слева (запасной)
+                    {centerPlaced.x, centerPlaced.y - h - GAP}                // Сверху (запасной)
                 };
-
-                for (auto& slot : slots) {
-                    int cx = slot.first;
-                    int cy = slot.second;
-
-                    // Проверяем, не пересекается ли этот слот с УЖЕ размещенными окнами
-                    if (!intersects(cx, cy, w, h, placed)) {
-                        // Считаем расстояние от центра (0,0) до центра этого слота
-                        int slotCenterX = cx + w/2;
-                        int slotCenterY = cy + h/2;
-                        long long distSq = 1LL * slotCenterX * slotCenterX + 1LL * slotCenterY * slotCenterY;
-
-                        // Выбираем слот с минимальным расстоянием до центра
-                        if (minDistSq == -1 || distSq < minDistSq) {
-                            minDistSq = distSq;
-                            bestPos = {cx, cy};
+            } else if (isLeft && isBottom) {
+                // Левый нижний квадрант
+                slots = {
+                    {centerPlaced.x - w - GAP, centerPlaced.y},               // Слева
+                    {centerPlaced.x, centerPlaced.y + centerPlaced.h + GAP},  // Снизу
+                    {centerPlaced.x - w - GAP, centerPlaced.y + centerPlaced.h + GAP}, // Левый нижний угол
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y},  // Справа (запасной)
+                    {centerPlaced.x, centerPlaced.y - h - GAP}                // Сверху (запасной)
+                };
+            } else if (isRight && isTop) {
+                // Правый верхний квадрант
+                slots = {
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y},  // Справа
+                    {centerPlaced.x, centerPlaced.y - h - GAP},               // Сверху
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y - h - GAP}, // Правый верхний угол
+                    {centerPlaced.x - w - GAP, centerPlaced.y},               // Слева (запасной)
+                    {centerPlaced.x, centerPlaced.y + centerPlaced.h + GAP}   // Снизу (запасной)
+                };
+            } else if (isLeft && isTop) {
+                // Левый верхний квадрант
+                slots = {
+                    {centerPlaced.x - w - GAP, centerPlaced.y},               // Слева
+                    {centerPlaced.x, centerPlaced.y - h - GAP},               // Сверху
+                    {centerPlaced.x - w - GAP, centerPlaced.y - h - GAP},     // Левый верхний угол
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y},  // Справа (запасной)
+                    {centerPlaced.x, centerPlaced.y + centerPlaced.h + GAP}   // Снизу (запасной)
+                };
+            } else if (isRight) {
+                // Строго справа
+                slots = {
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y},
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y + centerPlaced.h + GAP},
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y - h - GAP},
+                    {centerPlaced.x, centerPlaced.y + centerPlaced.h + GAP},
+                    {centerPlaced.x, centerPlaced.y - h - GAP}
+                };
+            } else if (isLeft) {
+                // Строго слева
+                slots = {
+                    {centerPlaced.x - w - GAP, centerPlaced.y},
+                    {centerPlaced.x - w - GAP, centerPlaced.y + centerPlaced.h + GAP},
+                    {centerPlaced.x - w - GAP, centerPlaced.y - h - GAP},
+                    {centerPlaced.x, centerPlaced.y + centerPlaced.h + GAP},
+                    {centerPlaced.x, centerPlaced.y - h - GAP}
+                };
+            } else if (isBottom) {
+                // Строго снизу
+                slots = {
+                    {centerPlaced.x, centerPlaced.y + centerPlaced.h + GAP},
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y + centerPlaced.h + GAP},
+                    {centerPlaced.x - w - GAP, centerPlaced.y + centerPlaced.h + GAP},
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y},
+                    {centerPlaced.x - w - GAP, centerPlaced.y}
+                };
+            } else {
+                // Строго сверху (или dx=0, dy=0)
+                slots = {
+                    {centerPlaced.x, centerPlaced.y - h - GAP},
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y - h - GAP},
+                    {centerPlaced.x - w - GAP, centerPlaced.y - h - GAP},
+                    {centerPlaced.x + centerPlaced.w + GAP, centerPlaced.y},
+                    {centerPlaced.x - w - GAP, centerPlaced.y}
+                };
+            }
+            
+            // Пробуем слоты в порядке приоритета
+            bool found = false;
+            for (auto& slot : slots) {
+                if (!intersects(slot.first, slot.second, w, h)) {
+                    bestPos = {slot.first, slot.second};
+                    found = true;
+                    break;
+                }
+            }
+            
+            // Если не нашли место вокруг центрального, пробуем вокруг других
+            if (!found) {
+                long long minDist = LLONG_MAX;
+                for (size_t pi = 1; pi < placed.size(); ++pi) {
+                    const auto& pr = placed[pi];
+                    std::vector<std::pair<int, int>> fallbackSlots = {
+                        {pr.x + pr.w + GAP, pr.y},
+                        {pr.x - w - GAP, pr.y},
+                        {pr.x, pr.y + pr.h + GAP},
+                        {pr.x, pr.y - h - GAP}
+                    };
+                    
+                    for (auto& slot : fallbackSlots) {
+                        if (!intersects(slot.first, slot.second, w, h)) {
+                            long long dist = 1LL * slot.first * slot.first + 1LL * slot.second * slot.second;
+                            if (dist < minDist) {
+                                minDist = dist;
+                                bestPos = {slot.first, slot.second};
+                                found = true;
+                            }
                         }
                     }
                 }
+            }
+            
+            // Последний запасной вариант
+            if (!found && !placed.empty()) {
+                const auto& last = placed.back();
+                bestPos = {last.x + last.w + GAP, last.y};
             }
         }
 
@@ -711,45 +866,25 @@ void ArrangeGrid() {
         finalPositions.push_back(bestPos);
     }
 
-    // 4. Центрирование всей полученной фигуры на экране
-    int minX = INT_MAX, minY = INT_MAX, maxX = INT_MIN, maxY = INT_MIN;
-    for (const auto& p : placed) {
-        if (p.x < minX) minX = p.x;
-        if (p.y < minY) minY = p.y;
-        if (p.x + p.w > maxX) maxX = p.x + p.w;
-        if (p.y + p.h > maxY) maxY = p.y + p.h;
-    }
+    // 6. Центрирование на экране
+    int offsetX = screenCx;
+    int offsetY = screenCy;
 
-    int totalW = maxX - minX;
-    int totalH = maxY - minY;
-    int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
-    int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
-
-    // Смещение, чтобы центр фигуры совпал с центром экрана
-    int offsetX = screenCx - (minX + totalW / 2);
-    int offsetY = screenCy - (minY + totalH / 2);
-
-    // 5. Формирование анимации
-    for (size_t i = 0; i < list.size(); ++i) {
+    // 7. Формирование анимации
+    for (size_t i = 0; i < sortedList.size(); ++i) {
         GridAnimItem item;
-        item.hwnd = list[i].hwnd;
-        item.startX = list[i].baseX; 
-        item.startY = list[i].baseY;
-        
-        // Применяем смещение
+        item.hwnd = sortedList[i].hwnd;
+        item.startX = sortedList[i].baseX;
+        item.startY = sortedList[i].baseY;
         item.endX = finalPositions[i].x + offsetX;
         item.endY = finalPositions[i].y + offsetY;
-        
-        item.width = list[i].width;
-        item.height = list[i].height;
+        item.width = sortedList[i].width;
+        item.height = sortedList[i].height;
         
         g_gridAnim.items.push_back(item);
     }
 
-    EnterCriticalSection(&g_lock);
     g_camOffset = {0, 0};
-    LeaveCriticalSection(&g_lock);
-
     g_gridAnim.startTime = std::chrono::steady_clock::now();
     g_gridAnim.active = true;
 
@@ -1277,10 +1412,44 @@ void Zoom(float scale) {
     if (g_gridAnim.active) return;
 
     EnterCriticalSection(&g_lock);
-    POINT center = {GetSystemMetrics(SM_CXSCREEN)/2, GetSystemMetrics(SM_CYSCREEN)/2};
     if (g_snapshots.empty()) { LeaveCriticalSection(&g_lock); return; }
+
+    // Находим центральное окно (первое в списке после ArrangeGrid)
+    // Оно должно быть ближайшим к центру экрана
+    int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
+    int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
+    
+    // Находим центр сетки (центральное окно)
+    WindowSnapshot* centerWindow = nullptr;
+    long long minDistSq = LLONG_MAX;
+    
+    for (auto& s : g_snapshots) {
+        if (!IsWindow(s.hwnd)) continue;
+        
+        // Вычисляем текущую позицию окна на экране
+        int physX = s.baseX + g_camOffset.x;
+        int physY = s.baseY + g_camOffset.y;
+        int cx = physX + s.width / 2;
+        int cy = physY + s.height / 2;
+        
+        long long distSq = 1LL * (cx - screenCx) * (cx - screenCx) + 
+                          1LL * (cy - screenCy) * (cy - screenCy);
+        
+        if (distSq < minDistSq) {
+            minDistSq = distSq;
+            centerWindow = &s;
+        }
+    }
+    
+    if (!centerWindow) { LeaveCriticalSection(&g_lock); return; }
+    
+    // Центр сетки в координатах холста (относительные координаты)
+    int gridCenterX = centerWindow->baseX + centerWindow->width / 2;
+    int gridCenterY = centerWindow->baseY + centerWindow->height / 2;
+    
     std::vector<WindowMoveOp> ops;
     ops.reserve(g_snapshots.size());
+    
     for (auto& s : g_snapshots) {
         if (!IsWindow(s.hwnd)) continue;
 
@@ -1293,18 +1462,39 @@ void Zoom(float scale) {
             continue;
         }
 
-        // Масштабируем относительно центра экрана
-        int physX = s.baseX + g_camOffset.x;
-        int physY = s.baseY + g_camOffset.y;
-        int ncx = center.x + (int)((physX + s.width/2 - center.x) * scale);
-        int ncy = center.y + (int)((physY + s.height/2 - center.y) * scale);
+        // Масштабируем относительно центра сетки (в координатах холста)
+        int oldCenterX = s.baseX + s.width / 2;
+        int oldCenterY = s.baseY + s.height / 2;
+        
+        // Вектор от центра сетки до центра окна
+        int dx = oldCenterX - gridCenterX;
+        int dy = oldCenterY - gridCenterY;
+        
+        // Масштабируем этот вектор
+        int newDx = (int)(dx * scale);
+        int newDy = (int)(dy * scale);
+        
+        // Новая позиция центра окна в координатах холста
+        int newCenterX = gridCenterX + newDx;
+        int newCenterY = gridCenterY + newDy;
+        
+        // Новая позиция верхнего левого угла в координатах холста
+        int newBaseX = newCenterX - nw / 2;
+        int newBaseY = newCenterY - nh / 2;
+        
+        // Преобразуем в экранные координаты для SetWindowPos
+        int screenX = newBaseX + g_camOffset.x;
+        int screenY = newBaseY + g_camOffset.y;
 
-        ops.push_back({s.hwnd, ncx - nw/2, ncy - nh/2, nw, nh, SWP_NOZORDER|SWP_NOACTIVATE});
-        s.baseX = (ncx - nw/2) - g_camOffset.x;
-        s.baseY = (ncy - nh/2) - g_camOffset.y;
+        ops.push_back({s.hwnd, screenX, screenY, nw, nh, SWP_NOZORDER|SWP_NOACTIVATE});
+        
+        // Обновляем снапшот
+        s.baseX = newBaseX;
+        s.baseY = newBaseY;
         s.width = nw;
         s.height = nh;
     }
+    
     LeaveCriticalSection(&g_lock);
     ApplyMoves(ops);
 }
