@@ -21,10 +21,50 @@ const int CANVAS_HEIGHT = 10000;
 
 // Структура конфигурации
 struct Config {
+    // Клавиши
     WPARAM activateKey;
     WPARAM panKey;
+    
+    // Анимация
+    int threadSleepMs;
+    int gridAnimDuration;
+    int camAnimDuration;
+    int zoomAnimDuration;
+    
+    // Физика
+    int physicsDelayMs;
+    int maxPhysicsDistance;
+    int windowGap;
+    
+    // Double-tap
+    int doubleTapTimeout;
+    int holdThreshold;
+    
+    // Зум лимиты
+    int minWindowSize;
+    float maxWindowSizePercent;
+    
+    // Canvas
+    int canvasWidth;
+    int canvasHeight;
 
-    Config() : activateKey(VK_RCONTROL), panKey(0) {}
+    Config() : 
+        activateKey(VK_RCONTROL), 
+        panKey(0),
+        threadSleepMs(8),
+        gridAnimDuration(600),
+        camAnimDuration(400),
+        zoomAnimDuration(150),
+        physicsDelayMs(1000),
+        maxPhysicsDistance(100),
+        windowGap(2),
+        doubleTapTimeout(300),
+        holdThreshold(200),
+        minWindowSize(300),
+        maxWindowSizePercent(0.98f),
+        canvasWidth(10000),
+        canvasHeight(10000)
+    {}
 };
 
 // Путь к config.ini (%APPDATA%\WCWM\config.ini)
@@ -45,25 +85,53 @@ void EnsureConfigDir() {
     }
 }
 
+// Forward declaration
+void SaveConfig(const Config& cfg);
+
 // Загрузить конфиг из файла (если нет — использовать дефолты)
 Config LoadConfig() {
     Config cfg;
     std::wstring path = GetConfigPath();
 
-    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        return cfg; // Файла нет — возвращаем дефолты
+    bool fileExists = (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES);
+    
+    if (!fileExists) {
+        // Файла нет — создаём с дефолтами
+        SaveConfig(cfg);
+        return cfg;
     }
 
-    // Читаем значения из INI
+    // Читаем клавиши
     int activate = GetPrivateProfileIntW(L"General", L"activateKey", (int)cfg.activateKey, path.c_str());
     int pan = GetPrivateProfileIntW(L"General", L"panKey", (int)cfg.panKey, path.c_str());
-
-    // Валидация: проверяем разумные диапазоны виртуальных кодов (1..255)
+    
     if (activate >= 1 && activate <= 255) cfg.activateKey = (WPARAM)activate;
-    else cfg.activateKey = VK_RCONTROL;
-
     if (pan >= 0 && pan <= 255) cfg.panKey = (WPARAM)pan;
-    else cfg.panKey = 0;
+
+    // Читаем анимацию
+    cfg.threadSleepMs = GetPrivateProfileIntW(L"Animation", L"threadSleepMs", cfg.threadSleepMs, path.c_str());
+    cfg.gridAnimDuration = GetPrivateProfileIntW(L"Animation", L"gridAnimDuration", cfg.gridAnimDuration, path.c_str());
+    cfg.camAnimDuration = GetPrivateProfileIntW(L"Animation", L"camAnimDuration", cfg.camAnimDuration, path.c_str());
+    cfg.zoomAnimDuration = GetPrivateProfileIntW(L"Animation", L"zoomAnimDuration", cfg.zoomAnimDuration, path.c_str());
+
+    // Читаем физику
+    cfg.physicsDelayMs = GetPrivateProfileIntW(L"Physics", L"physicsDelayMs", cfg.physicsDelayMs, path.c_str());
+    cfg.maxPhysicsDistance = GetPrivateProfileIntW(L"Physics", L"maxPhysicsDistance", cfg.maxPhysicsDistance, path.c_str());
+    cfg.windowGap = GetPrivateProfileIntW(L"Physics", L"windowGap", cfg.windowGap, path.c_str());
+
+    // Читаем double-tap
+    cfg.doubleTapTimeout = GetPrivateProfileIntW(L"DoubleTap", L"doubleTapTimeout", cfg.doubleTapTimeout, path.c_str());
+    cfg.holdThreshold = GetPrivateProfileIntW(L"DoubleTap", L"holdThreshold", cfg.holdThreshold, path.c_str());
+
+    // Читаем зум лимиты
+    cfg.minWindowSize = GetPrivateProfileIntW(L"Zoom", L"minWindowSize", cfg.minWindowSize, path.c_str());
+    wchar_t percentBuf[32];
+    GetPrivateProfileStringW(L"Zoom", L"maxWindowSizePercent", L"0.98", percentBuf, 32, path.c_str());
+    cfg.maxWindowSizePercent = (float)_wtof(percentBuf);
+
+    // Читаем canvas
+    cfg.canvasWidth = GetPrivateProfileIntW(L"Canvas", L"canvasWidth", cfg.canvasWidth, path.c_str());
+    cfg.canvasHeight = GetPrivateProfileIntW(L"Canvas", L"canvasHeight", cfg.canvasHeight, path.c_str());
 
     return cfg;
 }
@@ -74,12 +142,49 @@ void SaveConfig(const Config& cfg) {
     std::wstring path = GetConfigPath();
     std::wstring tmpPath = path + L".tmp";
 
-    // Пишем во временный файл
     wchar_t buf[32];
+    
+    // General
     swprintf_s(buf, L"%d", (int)cfg.activateKey);
     WritePrivateProfileStringW(L"General", L"activateKey", buf, tmpPath.c_str());
     swprintf_s(buf, L"%d", (int)cfg.panKey);
     WritePrivateProfileStringW(L"General", L"panKey", buf, tmpPath.c_str());
+    
+    // Animation
+    swprintf_s(buf, L"%d", cfg.threadSleepMs);
+    WritePrivateProfileStringW(L"Animation", L"threadSleepMs", buf, tmpPath.c_str());
+    swprintf_s(buf, L"%d", cfg.gridAnimDuration);
+    WritePrivateProfileStringW(L"Animation", L"gridAnimDuration", buf, tmpPath.c_str());
+    swprintf_s(buf, L"%d", cfg.camAnimDuration);
+    WritePrivateProfileStringW(L"Animation", L"camAnimDuration", buf, tmpPath.c_str());
+    swprintf_s(buf, L"%d", cfg.zoomAnimDuration);
+    WritePrivateProfileStringW(L"Animation", L"zoomAnimDuration", buf, tmpPath.c_str());
+    
+    // Physics
+    swprintf_s(buf, L"%d", cfg.physicsDelayMs);
+    WritePrivateProfileStringW(L"Physics", L"physicsDelayMs", buf, tmpPath.c_str());
+    swprintf_s(buf, L"%d", cfg.maxPhysicsDistance);
+    WritePrivateProfileStringW(L"Physics", L"maxPhysicsDistance", buf, tmpPath.c_str());
+    swprintf_s(buf, L"%d", cfg.windowGap);
+    WritePrivateProfileStringW(L"Physics", L"windowGap", buf, tmpPath.c_str());
+    
+    // DoubleTap
+    swprintf_s(buf, L"%d", cfg.doubleTapTimeout);
+    WritePrivateProfileStringW(L"DoubleTap", L"doubleTapTimeout", buf, tmpPath.c_str());
+    swprintf_s(buf, L"%d", cfg.holdThreshold);
+    WritePrivateProfileStringW(L"DoubleTap", L"holdThreshold", buf, tmpPath.c_str());
+    
+    // Zoom
+    swprintf_s(buf, L"%d", cfg.minWindowSize);
+    WritePrivateProfileStringW(L"Zoom", L"minWindowSize", buf, tmpPath.c_str());
+    swprintf_s(buf, L"%.2f", cfg.maxWindowSizePercent);
+    WritePrivateProfileStringW(L"Zoom", L"maxWindowSizePercent", buf, tmpPath.c_str());
+    
+    // Canvas
+    swprintf_s(buf, L"%d", cfg.canvasWidth);
+    WritePrivateProfileStringW(L"Canvas", L"canvasWidth", buf, tmpPath.c_str());
+    swprintf_s(buf, L"%d", cfg.canvasHeight);
+    WritePrivateProfileStringW(L"Canvas", L"canvasHeight", buf, tmpPath.c_str());
 
     // Атомарная замена
     MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
@@ -90,9 +195,6 @@ Config g_config;
 
 WPARAM g_activateKey = VK_RCONTROL;
 WPARAM g_panKey = 0;
-
-const int THREAD_SLEEP_MS = 8; // Частота обновления (меньше = больше FPS, но выше нагрузка)
-const int GRID_ANIM_DURATION = 600; // Длительность анимации сетки (мс)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // СТРУКТУРЫ
@@ -129,7 +231,7 @@ struct GridAnimState {
     bool active = false;
     std::vector<GridAnimItem> items;
     std::chrono::steady_clock::time_point startTime;
-    int durationMs = GRID_ANIM_DURATION;
+    int durationMs = 600;
 };
 
 // Вспомогательная структура для сортировки окон
@@ -1415,7 +1517,7 @@ void WorkerFunc() {
             lastDebugUpdate = now;
         }
         
-        std::this_thread::sleep_for(std::chrono::milliseconds(THREAD_SLEEP_MS));
+        std::this_thread::sleep_for(std::chrono::milliseconds(g_config.threadSleepMs));
     }
 }
 // ═══════════════════════════════════════════════════════════════════════════════
