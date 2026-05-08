@@ -91,7 +91,7 @@ Config g_config;
 WPARAM g_activateKey = VK_RCONTROL;
 WPARAM g_panKey = 0;
 
-const int THREAD_SLEEP_MS = 1; 
+const int THREAD_SLEEP_MS = 8; // Частота обновления (меньше = больше FPS, но выше нагрузка)
 const int GRID_ANIM_DURATION = 600; // Длительность анимации сетки (мс)
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -101,6 +101,7 @@ struct WindowSnapshot {
     HWND hwnd;
     int  baseX, baseY; 
     int  width, height;
+    int  originalWidth, originalHeight; // Исходные размеры для анимации зума
 };
 
 struct WindowMoveOp {
@@ -225,6 +226,26 @@ std::atomic<bool> g_autoCamAnim(false);
 // Анимация сетки
 GridAnimState g_gridAnim;
 
+// Анимация зума
+struct ZoomAnimState {
+    bool active = false;
+    std::chrono::steady_clock::time_point startTime;
+    int durationMs = 150; // Длительность анимации зума
+    
+    // Снимок начального состояния
+    struct WindowState {
+        HWND hwnd;
+        int startX, startY, startW, startH;
+        int targetX, targetY, targetW, targetH;
+    };
+    std::vector<WindowState> windows;
+};
+ZoomAnimState g_zoomAnim;
+std::atomic<bool> g_lastZoomWasIn{false}; // Направление последнего зума для физики
+std::chrono::steady_clock::time_point g_lastZoomTime;
+const int PHYSICS_DELAY_MS = 1000; // Задержка перед запуском физики после зума (1 секунда)
+std::atomic<bool> g_physicsScheduled{false}; // Флаг: физика запланирована
+
 std::wstring g_debugText = L"";
 CRITICAL_SECTION g_debugLock;
 
@@ -252,6 +273,9 @@ struct PendingWindow {
 };
 
 std::vector<PendingWindow> g_pendingWindows;
+
+// Центральное окно (определяется в ArrangeGrid)
+HWND g_centerWindow = NULL;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // УТИЛИТЫ
@@ -450,6 +474,7 @@ bool IsValidWnd(HWND h) {
 void ArrangeGrid();
 void TakeSnapshot();
 void FocusOnWindow(HWND target);
+void ResolveCollisionsAfterZoom(bool isZoomIn);
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -490,6 +515,9 @@ void UpdateDebugWindow() {
     ss << L"=== WCWM DEBUG ===\n";
     ss << L"Camera: " << g_camOffset.x << L", " << g_camOffset.y << L"\n";
     ss << L"Grid Anim: " << (g_gridAnim.active ? L"RUNNING" : L"IDLE") << L"\n";
+    ss << L"Zoom Anim: " << (g_zoomAnim.active ? L"RUNNING" : L"IDLE") << L"\n";
+    ss << L"Physics Scheduled: " << (g_physicsScheduled.load() ? L"YES" : L"NO") << L"\n";
+    ss << L"Last Zoom: " << (g_lastZoomWasIn.load() ? L"IN" : L"OUT") << L"\n";
     ss << L"Windows Cached: " << g_snapshots.size() << L"\n";
     ss << L"Activate: " << GetKeyNameStr(g_activateKey) << L"\n";
     ss << L"Pan: " << GetKeyNameStr(g_panKey) << L"\n";
@@ -661,6 +689,9 @@ void ArrangeGrid() {
     WindowSnapshot centerWindow = list[centerIdx];
     int centerCx = centerWindow.baseX + centerWindow.width / 2;
     int centerCy = centerWindow.baseY + centerWindow.height / 2;
+    
+    // ВАЖНО: Запоминаем центральное окно для физики коллизий
+    g_centerWindow = centerWindow.hwnd;
 
     // Создаём пары (окно, расстояние до центра)
     struct WindowWithDist {
@@ -719,8 +750,8 @@ void ArrangeGrid() {
         POINT bestPos = {0, 0};
 
         if (i == 0) {
-            // Центральное окно в центр координат
-            bestPos = { -w/2, -h/2 };
+            // Центральное окно остаётся на месте (используем его текущие координаты)
+            bestPos = { sortedList[i].baseX - screenCx, sortedList[i].baseY - screenCy };
         } else {
             // Определяем, где окно находилось относительно центрального
             int windowCx = sortedList[i].baseX + w / 2;
@@ -1285,7 +1316,81 @@ void WorkerFunc() {
         if (!ops.empty()) ApplyMoves(ops);
 
         // ============================================================
-        // 4. ОБНОВЛЕНИЕ DEBUG (Раз в 200мс)
+        // 4. АНИМАЦИЯ ЗУМА
+        // ============================================================
+        if (g_zoomAnim.active) {
+            auto animNow = std::chrono::steady_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(animNow - g_zoomAnim.startTime).count();
+            float t = std::min(1.0f, (float)ms / g_zoomAnim.durationMs);
+            float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t); // cubic ease-out
+            
+            // КРИТИЧНО: Быстро копируем данные под локом
+            std::vector<ZoomAnimState::WindowState> localZoomWindows;
+            EnterCriticalSection(&g_lock);
+            localZoomWindows = g_zoomAnim.windows; // Быстрое копирование
+            LeaveCriticalSection(&g_lock);
+            
+            // Вычисления БЕЗ ЛОКА
+            std::vector<WindowMoveOp> zoomOps;
+            zoomOps.reserve(localZoomWindows.size());
+            
+            for (const auto& ws : localZoomWindows) {
+                if (!IsWindow(ws.hwnd)) continue;
+                
+                // Интерполируем позицию и размер
+                int curX = (int)(ws.startX + (ws.targetX - ws.startX) * ease);
+                int curY = (int)(ws.startY + (ws.targetY - ws.startY) * ease);
+                int curW = (int)(ws.startW + (ws.targetW - ws.startW) * ease);
+                int curH = (int)(ws.startH + (ws.targetH - ws.startH) * ease);
+                
+                zoomOps.push_back({ws.hwnd, curX, curY, curW, curH, SWP_NOZORDER|SWP_NOACTIVATE});
+            }
+            
+            if (!zoomOps.empty()) ApplyMoves(zoomOps);
+            
+            // Завершение анимации
+            if (t >= 1.0f) {
+                EnterCriticalSection(&g_lock);
+                g_zoomAnim.active = false;
+                
+                // Обновляем снапшоты реальными размерами после зума
+                for (auto& s : g_snapshots) {
+                    if (!IsWindow(s.hwnd)) continue;
+                    RECT r;
+                    if (GetWindowRect(s.hwnd, &r)) {
+                        s.baseX = r.left - g_camOffset.x;
+                        s.baseY = r.top - g_camOffset.y;
+                        s.width = r.right - r.left;
+                        s.height = r.bottom - r.top;
+                    }
+                }
+                
+                g_zoomAnim.windows.clear();
+                
+                LeaveCriticalSection(&g_lock);
+                
+                // Запускаем физику коллизий после завершения зума
+                // Используем сохранённое направление
+                bool wasZoomIn = g_lastZoomWasIn.load(std::memory_order_relaxed);
+                ResolveCollisionsAfterZoom(wasZoomIn);
+            }
+        }
+        
+        // Проверка запланированной физики
+        if (g_physicsScheduled.load(std::memory_order_relaxed)) {
+            auto timeSinceLastZoom = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - g_lastZoomTime
+            ).count();
+            
+            if (timeSinceLastZoom >= PHYSICS_DELAY_MS) {
+                g_physicsScheduled.store(false, std::memory_order_relaxed);
+                bool wasZoomIn = g_lastZoomWasIn.load(std::memory_order_relaxed);
+                ResolveCollisionsAfterZoom(wasZoomIn);
+            }
+        }
+
+        // ============================================================
+        // 5. ОБНОВЛЕНИЕ DEBUG (Раз в 200мс)
         // ============================================================
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastDebugUpdate).count() >= 200) {
             UpdateDebugWindow();
@@ -1392,8 +1497,8 @@ void StartDrag(POINT p) {
 
 // Проверка лимитов масштабирования
 bool CheckScaleLimits(int width, int height) {
-    // Минимум: любая сторона должна быть >= 100px
-    if (width < 100 || height < 100) {
+    // Минимум: любая сторона должна быть >= 300px
+    if (width < 300 || height < 300) {
         return false;
     }
 
@@ -1410,93 +1515,462 @@ bool CheckScaleLimits(int width, int height) {
 
 void Zoom(float scale) {
     if (g_gridAnim.active) return;
-
+    
+    // Мгновенно применяем зум
     EnterCriticalSection(&g_lock);
-    if (g_snapshots.empty()) { LeaveCriticalSection(&g_lock); return; }
-
-    // Находим центральное окно (первое в списке после ArrangeGrid)
-    // Оно должно быть ближайшим к центру экрана
-    int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
-    int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
-    
-    // Находим центр сетки (центральное окно)
-    WindowSnapshot* centerWindow = nullptr;
-    long long minDistSq = LLONG_MAX;
-    
-    for (auto& s : g_snapshots) {
-        if (!IsWindow(s.hwnd)) continue;
-        
-        // Вычисляем текущую позицию окна на экране
-        int physX = s.baseX + g_camOffset.x;
-        int physY = s.baseY + g_camOffset.y;
-        int cx = physX + s.width / 2;
-        int cy = physY + s.height / 2;
-        
-        long long distSq = 1LL * (cx - screenCx) * (cx - screenCx) + 
-                          1LL * (cy - screenCy) * (cy - screenCy);
-        
-        if (distSq < minDistSq) {
-            minDistSq = distSq;
-            centerWindow = &s;
-        }
+    if (g_snapshots.empty()) { 
+        LeaveCriticalSection(&g_lock); 
+        return; 
     }
     
-    if (!centerWindow) { LeaveCriticalSection(&g_lock); return; }
+    // Запоминаем направление зума
+    bool isZoomIn = (scale > 1.0f);
+    g_lastZoomWasIn.store(isZoomIn, std::memory_order_relaxed);
     
-    // Центр сетки в координатах холста (относительные координаты)
-    int gridCenterX = centerWindow->baseX + centerWindow->width / 2;
-    int gridCenterY = centerWindow->baseY + centerWindow->height / 2;
-    
-    std::vector<WindowMoveOp> ops;
-    ops.reserve(g_snapshots.size());
+    // Применяем масштабирование мгновенно
+    std::vector<WindowMoveOp> zoomOps;
+    zoomOps.reserve(g_snapshots.size());
     
     for (auto& s : g_snapshots) {
         if (!IsWindow(s.hwnd)) continue;
-
-        // Вычисляем новый размер с сохранением пропорций
-        int nw = (int)(s.width * scale);
-        int nh = (int)(s.height * scale);
-
-        // Проверяем лимиты - если не проходит, пропускаем это окно
-        if (!CheckScaleLimits(nw, nh)) {
-            continue;
+        
+        RECT r;
+        if (!GetWindowRect(s.hwnd, &r)) continue;
+        
+        int targetW = (int)(s.width * scale);
+        int targetH = (int)(s.height * scale);
+        
+        // Применяем лимиты
+        if (!CheckScaleLimits(targetW, targetH)) {
+            continue; // Пропускаем окна, которые не могут масштабироваться
         }
-
-        // Масштабируем относительно центра сетки (в координатах холста)
-        int oldCenterX = s.baseX + s.width / 2;
-        int oldCenterY = s.baseY + s.height / 2;
         
-        // Вектор от центра сетки до центра окна
-        int dx = oldCenterX - gridCenterX;
-        int dy = oldCenterY - gridCenterY;
+        // Вычисляем центр окна
+        int centerX = r.left + (r.right - r.left) / 2;
+        int centerY = r.top + (r.bottom - r.top) / 2;
         
-        // Масштабируем этот вектор
-        int newDx = (int)(dx * scale);
-        int newDy = (int)(dy * scale);
+        // Новая позиция (центр остаётся на месте)
+        int targetX = centerX - targetW / 2;
+        int targetY = centerY - targetH / 2;
         
-        // Новая позиция центра окна в координатах холста
-        int newCenterX = gridCenterX + newDx;
-        int newCenterY = gridCenterY + newDy;
-        
-        // Новая позиция верхнего левого угла в координатах холста
-        int newBaseX = newCenterX - nw / 2;
-        int newBaseY = newCenterY - nh / 2;
-        
-        // Преобразуем в экранные координаты для SetWindowPos
-        int screenX = newBaseX + g_camOffset.x;
-        int screenY = newBaseY + g_camOffset.y;
-
-        ops.push_back({s.hwnd, screenX, screenY, nw, nh, SWP_NOZORDER|SWP_NOACTIVATE});
-        
-        // Обновляем снапшот
-        s.baseX = newBaseX;
-        s.baseY = newBaseY;
-        s.width = nw;
-        s.height = nh;
+        zoomOps.push_back({s.hwnd, targetX, targetY, targetW, targetH, SWP_NOZORDER|SWP_NOACTIVATE});
     }
     
     LeaveCriticalSection(&g_lock);
-    ApplyMoves(ops);
+    
+    // Применяем изменения мгновенно
+    if (!zoomOps.empty()) {
+        ApplyMoves(zoomOps);
+    }
+    
+    // Обновляем снапшоты
+    EnterCriticalSection(&g_lock);
+    for (auto& s : g_snapshots) {
+        if (!IsWindow(s.hwnd)) continue;
+        RECT r;
+        if (GetWindowRect(s.hwnd, &r)) {
+            s.baseX = r.left - g_camOffset.x;
+            s.baseY = r.top - g_camOffset.y;
+            s.width = r.right - r.left;
+            s.height = r.bottom - r.top;
+        }
+    }
+    LeaveCriticalSection(&g_lock);
+    
+    // Планируем запуск физики через 1 секунду
+    g_lastZoomTime = std::chrono::steady_clock::now();
+    g_physicsScheduled.store(true, std::memory_order_relaxed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ФИЗИКА КОЛЛИЗИЙ
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Структура для работы с окнами в физике
+struct PhysicsWindow {
+    HWND hwnd;
+    int x, y, w, h;
+    int centerX, centerY;
+    long long distFromCenter; // Расстояние от центрального окна
+};
+
+// Проверка пересечения двух прямоугольников с учётом зазора
+bool CheckCollision(int x1, int y1, int w1, int h1, int x2, int y2, int w2, int h2, int gap) {
+    return !(x1 + w1 + gap <= x2 || x1 >= x2 + w2 + gap ||
+             y1 + h1 + gap <= y2 || y1 >= y2 + h2 + gap);
+}
+
+// Вычисление минимального зазора между двумя окнами
+int CalculateGap(int x1, int y1, int w1, int h1, int x2, int y2, int w2, int h2) {
+    // Горизонтальное расстояние
+    int hGap = INT_MAX;
+    if (x1 + w1 <= x2) hGap = x2 - (x1 + w1);
+    else if (x2 + w2 <= x1) hGap = x1 - (x2 + w2);
+    else hGap = 0; // Перекрываются по X
+    
+    // Вертикальное расстояние
+    int vGap = INT_MAX;
+    if (y1 + h1 <= y2) vGap = y2 - (y1 + h1);
+    else if (y2 + h2 <= y1) vGap = y1 - (y2 + h2);
+    else vGap = 0; // Перекрываются по Y
+    
+    // Если перекрываются по обеим осям — коллизия (отрицательный зазор)
+    if (hGap == 0 && vGap == 0) {
+        // Вычисляем глубину проникновения
+        int overlapX = std::min(x1 + w1, x2 + w2) - std::max(x1, x2);
+        int overlapY = std::min(y1 + h1, y2 + h2) - std::max(y1, y2);
+        return -std::min(overlapX, overlapY);
+    }
+    
+    // Возвращаем минимальный зазор
+    return std::min(hGap, vGap);
+}
+
+// Вычисление вектора разрешения коллизии (кратчайший путь)
+void CalculateSeparationVector(int x1, int y1, int w1, int h1, 
+                                int x2, int y2, int w2, int h2,
+                                int& outDx, int& outDy) {
+    const int GAP = 2;
+    
+    // Вычисляем перекрытие по каждой оси
+    int overlapX = std::min(x1 + w1, x2 + w2) - std::max(x1, x2);
+    int overlapY = std::min(y1 + h1, y2 + h2) - std::max(y1, y2);
+    
+    // Выбираем ось с минимальным перекрытием (кратчайший путь)
+    if (overlapX < overlapY) {
+        // Разделяем по X
+        if (x1 < x2) {
+            outDx = -(overlapX + GAP); // Двигаем влево
+        } else {
+            outDx = overlapX + GAP; // Двигаем вправо
+        }
+        outDy = 0;
+    } else {
+        // Разделяем по Y
+        outDx = 0;
+        if (y1 < y2) {
+            outDy = -(overlapY + GAP); // Двигаем вверх
+        } else {
+            outDy = overlapY + GAP; // Двигаем вниз
+        }
+    }
+}
+
+// Рекурсивное выталкивание окна (цепная реакция)
+bool PushWindowRecursive(size_t windowIdx, std::vector<PhysicsWindow>& windows, 
+                         std::vector<bool>& processed, int depth = 0) {
+    const int MAX_DEPTH = 10; // Защита от бесконечной рекурсии
+    if (depth > MAX_DEPTH) return false;
+    if (processed[windowIdx]) return true;
+    
+    processed[windowIdx] = true;
+    PhysicsWindow& win = windows[windowIdx];
+    
+    // Собираем все коллизии
+    struct CollisionInfo {
+        size_t otherIdx;
+        int dx, dy;
+    };
+    std::vector<CollisionInfo> collisions;
+    
+    for (size_t i = 0; i < windows.size(); ++i) {
+        if (i == windowIdx) continue;
+        
+        const PhysicsWindow& other = windows[i];
+        if (CheckCollision(win.x, win.y, win.w, win.h, 
+                          other.x, other.y, other.w, other.h, 2)) {
+            int dx, dy;
+            CalculateSeparationVector(win.x, win.y, win.w, win.h,
+                                     other.x, other.y, other.w, other.h,
+                                     dx, dy);
+            collisions.push_back({i, dx, dy});
+        }
+    }
+    
+    if (collisions.empty()) return true;
+    
+    // Сначала рекурсивно выталкиваем все окна, с которыми есть коллизия
+    for (const auto& col : collisions) {
+        if (!PushWindowRecursive(col.otherIdx, windows, processed, depth + 1)) {
+            return false;
+        }
+    }
+    
+    // Теперь вычисляем суммарный вектор отталкивания
+    int totalDx = 0, totalDy = 0;
+    for (const auto& col : collisions) {
+        totalDx += col.dx;
+        totalDy += col.dy;
+    }
+    
+    // Применяем смещение
+    win.x += totalDx;
+    win.y += totalDy;
+    win.centerX = win.x + win.w / 2;
+    win.centerY = win.y + win.h / 2;
+    
+    return true;
+}
+
+// Притягивание окна к центру при уменьшении
+void PullWindowToCenter(PhysicsWindow& win, const std::vector<PhysicsWindow>& windows, 
+                        int centerX, int centerY) {
+    const int GAP = 2;
+    
+    // Вычисляем направление к центру
+    int dx = centerX - win.centerX;
+    int dy = centerY - win.centerY;
+    
+    if (dx == 0 && dy == 0) return; // Уже в центре
+    
+    // Нормализуем направление
+    float len = std::sqrt(1.0f * dx * dx + 1.0f * dy * dy);
+    float ndx = dx / len;
+    float ndy = dy / len;
+    
+    // Пробуем двигаться к центру пиксель за пикселем
+    int maxSteps = (int)len;
+    for (int step = 0; step < maxSteps; ++step) {
+        int newX = win.x + (int)(ndx * (step + 1));
+        int newY = win.y + (int)(ndy * (step + 1));
+        
+        // Проверяем минимальный зазор до всех окон
+        int minGap = INT_MAX;
+        for (const auto& other : windows) {
+            if (other.hwnd == win.hwnd) continue;
+            int gap = CalculateGap(newX, win.y, win.w, win.h,
+                                  other.x, other.y, other.w, other.h);
+            if (gap < minGap) minGap = gap;
+        }
+        
+        // Если зазор стал меньше 2px — останавливаемся
+        if (minGap < GAP) {
+            if (step > 0) {
+                win.x += (int)(ndx * step);
+                win.y += (int)(ndy * step);
+                win.centerX = win.x + win.w / 2;
+                win.centerY = win.y + win.h / 2;
+            }
+            return;
+        }
+    }
+    
+    // Если дошли сюда — можем двигаться на всё расстояние
+    win.x += dx;
+    win.y += dy;
+    win.centerX = centerX;
+    win.centerY = centerY;
+}
+
+// Разрешение коллизий после зума
+void ResolveCollisionsAfterZoom(bool isZoomIn) {
+    EnterCriticalSection(&g_lock);
+    
+    if (g_snapshots.empty()) {
+        LeaveCriticalSection(&g_lock);
+        return;
+    }
+    
+    const int GAP = 2;
+    HWND centerHwnd = g_centerWindow;
+    
+    // Создаём список окон
+    std::vector<PhysicsWindow> physWindows;
+    physWindows.reserve(g_snapshots.size());
+    
+    size_t centerPhysIdx = SIZE_MAX;
+    
+    for (size_t i = 0; i < g_snapshots.size(); ++i) {
+        if (!IsWindow(g_snapshots[i].hwnd)) continue;
+        
+        PhysicsWindow pw;
+        pw.hwnd = g_snapshots[i].hwnd;
+        pw.x = g_snapshots[i].baseX;
+        pw.y = g_snapshots[i].baseY;
+        pw.w = g_snapshots[i].width;
+        pw.h = g_snapshots[i].height;
+        pw.centerX = pw.x + pw.w / 2;
+        pw.centerY = pw.y + pw.h / 2;
+        
+        if (pw.hwnd == centerHwnd) {
+            centerPhysIdx = physWindows.size();
+            pw.distFromCenter = 0;
+        } else if (centerPhysIdx != SIZE_MAX) {
+            // Вычисляем расстояние от центрального окна
+            const PhysicsWindow& centerWin = physWindows[centerPhysIdx];
+            long long dx = pw.centerX - centerWin.centerX;
+            long long dy = pw.centerY - centerWin.centerY;
+            pw.distFromCenter = dx * dx + dy * dy;
+        }
+        
+        physWindows.push_back(pw);
+    }
+    
+    if (centerPhysIdx == SIZE_MAX) {
+        LeaveCriticalSection(&g_lock);
+        return;
+    }
+    
+    bool hadChanges = false;
+    
+    if (isZoomIn) {
+        // ПРИ УВЕЛИЧЕНИИ: только разрешаем коллизии
+        for (size_t i = 0; i < physWindows.size(); ++i) {
+            for (size_t j = i + 1; j < physWindows.size(); ++j) {
+                PhysicsWindow& win1 = physWindows[i];
+                PhysicsWindow& win2 = physWindows[j];
+                
+                if (CheckCollision(win1.x, win1.y, win1.w, win1.h,
+                                 win2.x, win2.y, win2.w, win2.h, GAP)) {
+                    hadChanges = true;
+                    
+                    int dx, dy;
+                    CalculateSeparationVector(win1.x, win1.y, win1.w, win1.h,
+                                            win2.x, win2.y, win2.w, win2.h,
+                                            dx, dy);
+                    
+                    bool win1IsCenter = (i == centerPhysIdx);
+                    bool win2IsCenter = (j == centerPhysIdx);
+                    
+                    if (win1IsCenter && !win2IsCenter) {
+                        win2.x -= dx;
+                        win2.y -= dy;
+                    } else if (win2IsCenter && !win1IsCenter) {
+                        win1.x += dx;
+                        win1.y += dy;
+                    } else if (!win1IsCenter && !win2IsCenter) {
+                        win1.x += dx / 2;
+                        win1.y += dy / 2;
+                        win2.x -= dx / 2;
+                        win2.y -= dy / 2;
+                    }
+                    
+                    win1.centerX = win1.x + win1.w / 2;
+                    win1.centerY = win1.y + win1.h / 2;
+                    win2.centerX = win2.x + win2.w / 2;
+                    win2.centerY = win2.y + win2.h / 2;
+                }
+            }
+        }
+    } else {
+        // ПРИ УМЕНЬШЕНИИ: итеративно притягиваем от ближайших к дальним
+        // Вычисляем расстояния для всех окон
+        for (size_t i = 0; i < physWindows.size(); ++i) {
+            if (i == centerPhysIdx) continue;
+            
+            const PhysicsWindow& centerWin = physWindows[centerPhysIdx];
+            long long dx = physWindows[i].centerX - centerWin.centerX;
+            long long dy = physWindows[i].centerY - centerWin.centerY;
+            physWindows[i].distFromCenter = dx * dx + dy * dy;
+        }
+        
+        // Сортируем по расстоянию (ближайшие первыми)
+        std::vector<size_t> indices;
+        for (size_t i = 0; i < physWindows.size(); ++i) {
+            if (i != centerPhysIdx) indices.push_back(i);
+        }
+        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            return physWindows[a].distFromCenter < physWindows[b].distFromCenter;
+        });
+        
+        // Притягиваем по очереди
+        const PhysicsWindow& centerWin = physWindows[centerPhysIdx];
+        for (size_t idx : indices) {
+            PhysicsWindow& win = physWindows[idx];
+            
+            // Вычисляем направление к центру
+            int dx = centerWin.centerX - win.centerX;
+            int dy = centerWin.centerY - win.centerY;
+            
+            if (dx == 0 && dy == 0) continue;
+            
+            // Нормализуем
+            float len = std::sqrt(1.0f * dx * dx + 1.0f * dy * dy);
+            float ndx = dx / len;
+            float ndy = dy / len;
+            
+            // Пробуем двигаться к центру пиксель за пикселем
+            int maxSteps = (int)len;
+            for (int step = 1; step <= maxSteps; ++step) {
+                int newX = win.x + (int)(ndx * step);
+                int newY = win.y + (int)(ndy * step);
+                
+                // Проверяем коллизии со всеми окнами
+                bool hasCollision = false;
+                for (const auto& other : physWindows) {
+                    if (other.hwnd == win.hwnd) continue;
+                    if (CheckCollision(newX, newY, win.w, win.h,
+                                     other.x, other.y, other.w, other.h, GAP)) {
+                        hasCollision = true;
+                        break;
+                    }
+                }
+                
+                if (hasCollision) {
+                    // Применяем предыдущий шаг (если был)
+                    if (step > 1) {
+                        win.x += (int)(ndx * (step - 1));
+                        win.y += (int)(ndy * (step - 1));
+                        win.centerX = win.x + win.w / 2;
+                        win.centerY = win.y + win.h / 2;
+                        hadChanges = true;
+                    }
+                    break;
+                }
+                
+                // Если дошли до конца — применяем полное смещение
+                if (step == maxSteps) {
+                    win.x = newX;
+                    win.y = newY;
+                    win.centerX = win.x + win.w / 2;
+                    win.centerY = win.y + win.h / 2;
+                    hadChanges = true;
+                }
+            }
+        }
+    }
+    
+    if (!hadChanges) {
+        LeaveCriticalSection(&g_lock);
+        return;
+    }
+    
+    // Применяем результаты через анимацию
+    g_gridAnim.items.clear();
+    g_gridAnim.items.reserve(physWindows.size());
+    
+    for (const auto& pw : physWindows) {
+        RECT r;
+        if (!GetWindowRect(pw.hwnd, &r)) continue;
+        
+        GridAnimItem item;
+        item.hwnd = pw.hwnd;
+        item.startX = r.left;
+        item.startY = r.top;
+        item.endX = pw.x + g_camOffset.x;
+        item.endY = pw.y + g_camOffset.y;
+        item.width = pw.w;
+        item.height = pw.h;
+        
+        g_gridAnim.items.push_back(item);
+        
+        // Обновляем снапшот
+        for (auto& s : g_snapshots) {
+            if (s.hwnd == pw.hwnd) {
+                s.baseX = pw.x;
+                s.baseY = pw.y;
+                break;
+            }
+        }
+    }
+    
+    if (!g_gridAnim.items.empty()) {
+        g_gridAnim.startTime = std::chrono::steady_clock::now();
+        g_gridAnim.durationMs = 400; // Плавная анимация физики
+        g_gridAnim.active = true;
+    }
+    
+    LeaveCriticalSection(&g_lock);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1680,7 +2154,8 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
             return 1;
         }
         if (wParam == WM_MOUSEWHEEL) {
-            Zoom(GET_WHEEL_DELTA_WPARAM(m->mouseData) > 0 ? 1.1f : 0.9f);
+            // Фиксированное масштабирование: шаг 10%
+            Zoom(GET_WHEEL_DELTA_WPARAM(m->mouseData) > 0 ? 1.10f : 0.90f);
             return 1;
         }
     }
