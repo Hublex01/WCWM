@@ -750,8 +750,8 @@ void ArrangeGrid() {
         POINT bestPos = {0, 0};
 
         if (i == 0) {
-            // Центральное окно остаётся на месте (используем его текущие координаты)
-            bestPos = { sortedList[i].baseX - screenCx, sortedList[i].baseY - screenCy };
+            // Центральное окно размещается строго в центре (0, 0 в координатах сетки)
+            bestPos = { -w / 2, -h / 2 };
         } else {
             // Определяем, где окно находилось относительно центрального
             int windowCx = sortedList[i].baseX + w / 2;
