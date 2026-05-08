@@ -102,6 +102,7 @@ struct WindowSnapshot {
     int  baseX, baseY; 
     int  width, height;
     int  originalWidth, originalHeight; // Исходные размеры для анимации зума
+    float zoomDebt = 0.0f; // Накопленный долг зума (положительный = хотели увеличить, отрицательный = хотели уменьшить)
 };
 
 struct WindowMoveOp {
@@ -504,6 +505,14 @@ bool CheckDoubleTap(WPARAM vkCode, bool isKeyDown) {
 
 void HandleDoubleTapReset() {
     g_doubleTapHandled = false;
+    
+    // Сбрасываем долг зума у всех окон
+    EnterCriticalSection(&g_lock);
+    for (auto& s : g_snapshots) {
+        s.zoomDebt = 0.0f;
+    }
+    LeaveCriticalSection(&g_lock);
+    
     ArrangeGrid();
 }
 
@@ -544,7 +553,14 @@ void UpdateDebugWindow() {
         GetWindowTextW(s.hwnd, title, 255);
         if (wcslen(title) == 0) wcscpy_s(title, 256, L"<No Title>");
 
-        ss << L"[" << count << L"] " << title << L"\n";
+        ss << L"[" << count << L"] " << title;
+        
+        // Показываем долг зума, если он ненулевой
+        if (std::abs(s.zoomDebt) > 0.001f) {
+            ss << L" (debt: " << std::fixed << std::setprecision(1) << (s.zoomDebt * 100.0f) << L"%)";
+        }
+        
+        ss << L"\n";
         count++;
     }
     LeaveCriticalSection(&g_lock);
@@ -731,6 +747,8 @@ void ArrangeGrid() {
 
     auto intersects = [&](int nx, int ny, int nw, int nh) -> bool {
         for (const auto& pr : placed) {
+            // Проверка пересечения с учётом минимального зазора GAP между окнами
+            // Окна НЕ пересекаются, если между ними есть зазор >= GAP
             if (!(nx + nw + GAP <= pr.x || nx >= pr.x + pr.w + GAP || 
                   ny + nh + GAP <= pr.y || ny >= pr.y + pr.h + GAP)) {
                 return true;
@@ -1516,7 +1534,6 @@ bool CheckScaleLimits(int width, int height) {
 void Zoom(float scale) {
     if (g_gridAnim.active) return;
     
-    // Мгновенно применяем зум
     EnterCriticalSection(&g_lock);
     if (g_snapshots.empty()) { 
         LeaveCriticalSection(&g_lock); 
@@ -1527,7 +1544,33 @@ void Zoom(float scale) {
     bool isZoomIn = (scale > 1.0f);
     g_lastZoomWasIn.store(isZoomIn, std::memory_order_relaxed);
     
-    // Применяем масштабирование мгновенно
+    // Вычисляем изменение масштаба (например, 1.10 → +0.10, 0.90 → -0.10)
+    float scaleChange = scale - 1.0f;
+    
+    // Находим центральное окно и его центр
+    HWND centerHwnd = g_centerWindow;
+    POINT centerPoint = {0, 0};
+    bool foundCenter = false;
+    
+    for (const auto& s : g_snapshots) {
+        if (s.hwnd == centerHwnd && IsWindow(s.hwnd)) {
+            RECT r;
+            if (GetWindowRect(s.hwnd, &r)) {
+                centerPoint.x = r.left + (r.right - r.left) / 2;
+                centerPoint.y = r.top + (r.bottom - r.top) / 2;
+                foundCenter = true;
+                break;
+            }
+        }
+    }
+    
+    // Если центральное окно не найдено, используем центр экрана
+    if (!foundCenter) {
+        centerPoint.x = GetSystemMetrics(SM_CXSCREEN) / 2;
+        centerPoint.y = GetSystemMetrics(SM_CYSCREEN) / 2;
+    }
+    
+    // Применяем масштабирование с учётом долга
     std::vector<WindowMoveOp> zoomOps;
     zoomOps.reserve(g_snapshots.size());
     
@@ -1537,23 +1580,88 @@ void Zoom(float scale) {
         RECT r;
         if (!GetWindowRect(s.hwnd, &r)) continue;
         
-        int targetW = (int)(s.width * scale);
-        int targetH = (int)(s.height * scale);
+        // Текущий размер и центр окна
+        int currentW = r.right - r.left;
+        int currentH = r.bottom - r.top;
+        int currentCenterX = r.left + currentW / 2;
+        int currentCenterY = r.top + currentH / 2;
         
-        // Применяем лимиты
-        if (!CheckScaleLimits(targetW, targetH)) {
-            continue; // Пропускаем окна, которые не могут масштабироваться
+        // Вектор от центральной точки к центру окна
+        int vecX = currentCenterX - centerPoint.x;
+        int vecY = currentCenterY - centerPoint.y;
+        
+        // Пробуем применить зум с учётом долга
+        float newDebt = s.zoomDebt + scaleChange;
+        
+        // Вычисляем желаемый размер
+        int targetW = (int)(s.width * (1.0f + newDebt));
+        int targetH = (int)(s.height * (1.0f + newDebt));
+        
+        // Проверяем лимиты
+        bool canScale = CheckScaleLimits(targetW, targetH);
+        
+        if (canScale) {
+            // Окно может масштабироваться — применяем зум и обнуляем долг
+            s.zoomDebt = 0.0f;
+            s.width = targetW;
+            s.height = targetH;
+            
+            // КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Масштабируем вектор от центральной точки
+            int newVecX = (int)(vecX * scale);
+            int newVecY = (int)(vecY * scale);
+            
+            // Новый центр окна
+            int newCenterX = centerPoint.x + newVecX;
+            int newCenterY = centerPoint.y + newVecY;
+            
+            // Новая позиция окна (верхний левый угол)
+            int targetX = newCenterX - targetW / 2;
+            int targetY = newCenterY - targetH / 2;
+            
+            zoomOps.push_back({s.hwnd, targetX, targetY, targetW, targetH, SWP_NOZORDER|SWP_NOACTIVATE});
+        } else {
+            // Окно достигло лимита
+            // Проверяем, можем ли мы погасить долг
+            if ((newDebt > 0 && s.zoomDebt < 0) || (newDebt < 0 && s.zoomDebt > 0)) {
+                // Зум в противоположную сторону — гасим долг
+                if (std::abs(newDebt) < std::abs(s.zoomDebt)) {
+                    // Долг больше текущего зума — частично гасим
+                    s.zoomDebt = newDebt;
+                } else {
+                    // Долг погашен полностью, остаток идёт в масштабирование
+                    float remainder = newDebt - s.zoomDebt;
+                    s.zoomDebt = 0.0f;
+                    
+                    // Пробуем применить остаток
+                    int finalW = (int)(s.width * (1.0f + remainder));
+                    int finalH = (int)(s.height * (1.0f + remainder));
+                    
+                    if (CheckScaleLimits(finalW, finalH)) {
+                        s.width = finalW;
+                        s.height = finalH;
+                        
+                        // Масштабируем вектор с учётом остатка
+                        float remainderScale = 1.0f + remainder;
+                        int newVecX = (int)(vecX * remainderScale);
+                        int newVecY = (int)(vecY * remainderScale);
+                        
+                        int newCenterX = centerPoint.x + newVecX;
+                        int newCenterY = centerPoint.y + newVecY;
+                        
+                        int targetX = newCenterX - finalW / 2;
+                        int targetY = newCenterY - finalH / 2;
+                        
+                        zoomOps.push_back({s.hwnd, targetX, targetY, finalW, finalH, SWP_NOZORDER|SWP_NOACTIVATE});
+                    } else {
+                        // Остаток тоже не влезает — накапливаем новый долг
+                        s.zoomDebt = remainder;
+                    }
+                }
+            } else {
+                // Зум в ту же сторону — накапливаем долг
+                s.zoomDebt = newDebt;
+            }
         }
-        
-        // Вычисляем центр окна
-        int centerX = r.left + (r.right - r.left) / 2;
-        int centerY = r.top + (r.bottom - r.top) / 2;
-        
-        // Новая позиция (центр остаётся на месте)
-        int targetX = centerX - targetW / 2;
-        int targetY = centerY - targetH / 2;
-        
-        zoomOps.push_back({s.hwnd, targetX, targetY, targetW, targetH, SWP_NOZORDER|SWP_NOACTIVATE});
     }
     
     LeaveCriticalSection(&g_lock);
@@ -1563,7 +1671,7 @@ void Zoom(float scale) {
         ApplyMoves(zoomOps);
     }
     
-    // Обновляем снапшоты
+    // Обновляем снапшоты (позиции, без размеров — они уже обновлены)
     EnterCriticalSection(&g_lock);
     for (auto& s : g_snapshots) {
         if (!IsWindow(s.hwnd)) continue;
@@ -1571,8 +1679,7 @@ void Zoom(float scale) {
         if (GetWindowRect(s.hwnd, &r)) {
             s.baseX = r.left - g_camOffset.x;
             s.baseY = r.top - g_camOffset.y;
-            s.width = r.right - r.left;
-            s.height = r.bottom - r.top;
+            // Размеры уже обновлены выше, не перезаписываем
         }
     }
     LeaveCriticalSection(&g_lock);
