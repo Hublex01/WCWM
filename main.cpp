@@ -1,5 +1,8 @@
 #include <windows.h>
+#include <dwmapi.h>
 #include <vector>
+#include <algorithm>
+#pragma comment(lib, "dwmapi.lib")
 #include <algorithm>
 #include <atomic>
 #include <thread>
@@ -367,6 +370,28 @@ RECT g_btnBindRect = {0};
 RECT g_btnPanRect = {0};
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// UI STATE — Fonts & Hover
+// ═══════════════════════════════════════════════════════════════════════════════
+HFONT g_hFontBtn = NULL;      // Segoe UI Bold  — button labels
+HFONT g_hFontDebug = NULL;    // Consolas       — debug log
+bool  g_btnBindHover = false;
+bool  g_btnPanHover = false;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THEME — Catppuccin Mocha Palette
+// ═══════════════════════════════════════════════════════════════════════════════
+// All colors are straight RGB (0–255)
+const COLORREF CLR_BG           = RGB(30,  30,  46);  // #1E1E2E — base dark
+const COLORREF CLR_BTN_BIND_NORM= RGB(137, 180, 250); // #89B4FA — blue (activate)
+const COLORREF CLR_BTN_BIND_HOT = RGB(110, 153, 242); // #6E98F2 — blue hover (darker)
+const COLORREF CLR_BTN_BIND_ACT = RGB(250, 179, 135); // #FABFB7 — peach (listening)
+const COLORREF CLR_BTN_PAN_NORM = RGB(166, 227, 161); // #A6E3A1 — green (pan)
+const COLORREF CLR_BTN_PAN_HOT  = RGB(137, 220, 128); // #89E280 — green hover (darker)
+const COLORREF CLR_BTN_PAN_ACT  = RGB(250, 179, 135); // #FABFB7 — peach (listening)
+const COLORREF CLR_TEXT         = RGB(205, 214, 244); // #CDD6F4 — primary text
+const COLORREF CLR_TEXT_DIM     = RGB(166, 173, 200); // #A6ADc8 — secondary text
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // СТРУКТУРЫ ДЛЯ ОТЛОЖЕННОЙ СТЫКОВКИ
 // ═══════════════════════════════════════════════════════════════════════════════
 struct PendingWindow {
@@ -677,66 +702,189 @@ void UpdateDebugWindow() {
 LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
-            SetWindowTextW(hwnd, L"WCWM");
+            SetWindowTextW(hwnd, L"wcwm");
+            // ─── Create persistent fonts (Segoe UI for buttons, Consolas for debug log) ───
+            g_hFontBtn   = CreateFontW(12, 0, 0, 0, FW_BOLD,   0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
+            g_hFontDebug = CreateFontW(13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, FIXED_PITCH|FF_MODERN, L"Consolas");
+            // Hover states default to false — harmless if window created off-screen
+            g_btnBindHover = false;
+            g_btnPanHover  = false;
             return 0;
+
         case WM_SIZE: {
             RECT rc; GetClientRect(hwnd, &rc);
+            // Button layout: right-aligned, 160px wide × 30px tall, 5px v-gap
             g_btnBindRect = { rc.right - 170, 10, rc.right - 10, 40 };
-            g_btnPanRect = { rc.right - 170, 45, rc.right - 10, 75 };
+            g_btnPanRect  = { rc.right - 170, 45, rc.right - 10, 75 };
             return 0;
         }
+
+        case WM_MOUSEMOVE: {
+            POINT pt = { LOWORD(lParam), HIWORD(lParam) };
+            bool inBind = (PtInRect(&g_btnBindRect, pt) != 0);
+            bool inPan  = (PtInRect(&g_btnPanRect,  pt) != 0);
+            bool changed = (inBind != g_btnBindHover) || (inPan != g_btnPanHover);
+            if (changed) {
+                g_btnBindHover = inBind;
+                g_btnPanHover  = inPan;
+                InvalidateRect(hwnd, NULL, FALSE);  // repaint only if state changed
+            }
+            return 0;
+        }
+
         case WM_LBUTTONDOWN: {
             int x = LOWORD(lParam); int y = HIWORD(lParam);
             if (x >= g_btnBindRect.left && x <= g_btnBindRect.right && y >= g_btnBindRect.top && y <= g_btnBindRect.bottom) {
                 g_bindingMode = true; g_bindingPanKey = false;
-                if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
+                if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, FALSE);
             } else if (x >= g_btnPanRect.left && x <= g_btnPanRect.right && y >= g_btnPanRect.top && y <= g_btnPanRect.bottom) {
                 g_bindingMode = true; g_bindingPanKey = true;
-                if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
+                if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, FALSE);
             }
             return 0;
         }
+
+        case WM_ERASEBKGND:
+            return TRUE;  // Suppress default background erase — we handle it in WM_PAINT
+
         case WM_PAINT: {
             PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
             RECT rc; GetClientRect(hwnd, &rc);
-            HBRUSH hBrush = CreateSolidBrush(RGB(240, 240, 240));
-            FillRect(hdc, &rc, hBrush); DeleteObject(hBrush);
 
-            COLORREF c1 = (g_bindingMode && !g_bindingPanKey) ? RGB(255, 200, 200) : RGB(200, 220, 255);
-            HBRUSH b1 = CreateSolidBrush(c1); FillRect(hdc, &g_btnBindRect, b1); FrameRect(hdc, &g_btnBindRect, (HBRUSH)GetStockObject(BLACK_BRUSH)); DeleteObject(b1);
-            
-            COLORREF c2 = (g_bindingMode && g_bindingPanKey) ? RGB(255, 200, 200) : RGB(200, 255, 200);
-            HBRUSH b2 = CreateSolidBrush(c2); FillRect(hdc, &g_btnPanRect, b2); FrameRect(hdc, &g_btnPanRect, (HBRUSH)GetStockObject(BLACK_BRUSH)); DeleteObject(b2);
+            // ─── Double buffering: compatible memory DC + bitmap ───
+            HDC     hdcMem = CreateCompatibleDC(hdc);
+            HBITMAP hBmp   = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+            HBITMAP hOldBmp= (HBITMAP)SelectObject(hdcMem, hBmp);
 
-            SetBkMode(hdc, TRANSPARENT);
-            HFONT f = CreateFontW(12, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
-            HFONT old = (HFONT)SelectObject(hdc, f);
-            DrawTextW(hdc, (g_bindingMode && !g_bindingPanKey) ? L"LISTENING..." : L"Set Activate", -1, &g_btnBindRect, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-            DrawTextW(hdc, (g_bindingMode && g_bindingPanKey) ? L"LISTENING..." : L"Set Pan Key", -1, &g_btnPanRect, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-            SelectObject(hdc, old); DeleteObject(f);
+            // ─── Background ───────────────────────────────────────
+            HBRUSH hBgBrush = CreateSolidBrush(CLR_BG);
+            FillRect(hdcMem, &rc, hBgBrush);
+            DeleteObject(hBgBrush);
 
-            HFONT fc = CreateFontW(13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, FIXED_PITCH|FF_MODERN, L"Consolas");
-            SelectObject(hdc, fc);
+            // ─── Button: Set Activate ──────────────────────────────
+            COLORREF cBind = CLR_BTN_BIND_NORM;
+            if (g_bindingMode && !g_bindingPanKey)      cBind = CLR_BTN_BIND_ACT;
+            else if (g_btnBindHover && !g_bindingMode)  cBind = CLR_BTN_BIND_HOT;
+
+            HBRUSH hBrushBind = CreateSolidBrush(cBind);
+            RoundRect(hdcMem, g_btnBindRect.left, g_btnBindRect.top,
+                            g_btnBindRect.right, g_btnBindRect.bottom, 8, 8);
+
+            // Dark border (1px black) to separate from BG
+            HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+            HPEN hOldPen = (HPEN)SelectObject(hdcMem, hPen);
+            HBRUSH hNullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
+            HBRUSH hOldBrush = (HBRUSH)SelectObject(hdcMem, hNullBrush);
+            RoundRect(hdcMem, g_btnBindRect.left, g_btnBindRect.top,
+                            g_btnBindRect.right, g_btnBindRect.bottom, 8, 8);
+            SelectObject(hdcMem, hOldBrush);
+            SelectObject(hdcMem, hOldPen);
+            DeleteObject(hPen);
+            DeleteObject(hBrushBind);
+
+            // ─── Button: Set Pan Key ───────────────────────────────
+            COLORREF cPan = CLR_BTN_PAN_NORM;
+            if (g_bindingMode && g_bindingPanKey)       cPan = CLR_BTN_PAN_ACT;
+            else if (g_btnPanHover && !g_bindingMode)   cPan = CLR_BTN_PAN_HOT;
+
+            HBRUSH hBrushPan = CreateSolidBrush(cPan);
+            RoundRect(hdcMem, g_btnPanRect.left, g_btnPanRect.top,
+                            g_btnPanRect.right, g_btnPanRect.bottom, 8, 8);
+            // Border
+            hOldPen   = (HPEN)SelectObject(hdcMem, hPen);
+            hOldBrush = (HBRUSH)SelectObject(hdcMem, hNullBrush);
+            RoundRect(hdcMem, g_btnPanRect.left, g_btnPanRect.top,
+                            g_btnPanRect.right, g_btnPanRect.bottom, 8, 8);
+            SelectObject(hdcMem, hOldBrush);
+            SelectObject(hdcMem, hOldPen);
+            DeleteObject(hPen);        // hPen created above — safe delete after second use
+            DeleteObject(hBrushPan);
+
+            // ─── Button Text (Segoe UI Bold) ──────────────────────
+            SetBkMode(hdcMem, TRANSPARENT);
+            SetTextColor(hdcMem, CLR_TEXT);
+            HFONT hOldFontBtn = (HFONT)SelectObject(hdcMem, g_hFontBtn);
+            DrawTextW(hdcMem, (g_bindingMode && !g_bindingPanKey) ? L"LISTENING..." : L"Set Activate",
+                      -1, &g_btnBindRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(hdcMem, (g_bindingMode && g_bindingPanKey) ? L"LISTENING..." : L"Set Pan Key",
+                      -1, &g_btnPanRect,  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(hdcMem, hOldFontBtn);
+
+            // ─── Debug Log Text (Consolas) ────────────────────────
+            HFONT hOldFontDbg = (HFONT)SelectObject(hdcMem, g_hFontDebug);
+            SetTextColor(hdcMem, CLR_TEXT_DIM);
             RECT tr = { 10, 85, rc.right - 10, rc.bottom - 10 };
-            EnterCriticalSection(&g_debugLock); std::wstring t = g_debugText; LeaveCriticalSection(&g_debugLock);
-            DrawTextW(hdc, t.c_str(), -1, &tr, DT_LEFT|DT_TOP|DT_WORDBREAK);
-            DeleteObject(fc);
+            EnterCriticalSection(&g_debugLock);
+            std::wstring t = g_debugText;
+            LeaveCriticalSection(&g_debugLock);
+            DrawTextW(hdcMem, t.c_str(), -1, &tr, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            SelectObject(hdcMem, hOldFontDbg);
+
+            // ─── Blit memory → screen ─────────────────────────────
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdcMem, 0, 0, SRCCOPY);
+
+            // ─── Cleanup ───────────────────────────────────────────
+            SelectObject(hdcMem, hOldBmp);
+            DeleteObject(hBmp);
+            DeleteDC(hdcMem);
+
             EndPaint(hwnd, &ps);
             return 0;
         }
+
         case WM_DESTROY:
-            g_debugHwnd = NULL; PostQuitMessage(0); return 0;
+            // Clean up fonts to avoid GDI leaks
+            if (g_hFontBtn)   { DeleteObject(g_hFontBtn);   g_hFontBtn   = NULL; }
+            if (g_hFontDebug) { DeleteObject(g_hFontDebug); g_hFontDebug = NULL; }
+            g_debugHwnd = NULL;
+            PostQuitMessage(0);
+            return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// DWM TITLE BAR THEMING (Catppuccin Mocha)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Attempts to set a dark title bar with custom colors.
+// Strategy: Try DWMWA_CAPTION_COLOR first (Win11 22H2+).
+// If unsupported, fall back to DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 20H1+).
+// On older OS: no-op (light title bar accepted).
+// Note: DWMWA_CAPTION_COLOR (35), DWMWA_TEXT_COLOR (36), DWMWA_BORDER_COLOR (34)
+// are defined in newer SDKs; we use raw integers for maximum compatibility.
+void ApplyDarkTitleBar(HWND hwnd) {
+    if (!hwnd) return;
+
+    // Catppuccin Mocha colors
+    const COLORREF CLR_CAPTION = RGB(30, 30, 46);   // #1E1E2E
+    const COLORREF CLR_TEXT    = RGB(205, 214, 244); // #CDD6F4
+    const COLORREF CLR_BORDER  = RGB(30, 30, 46);   // match caption
+
+    // Try custom caption color (Win11 22H2+). If it works, also set text and border.
+    HRESULT hr = DwmSetWindowAttribute(hwnd, 35 /*DWMWA_CAPTION_COLOR*/, &CLR_CAPTION, sizeof(CLR_CAPTION));
+    if (SUCCEEDED(hr)) {
+        DwmSetWindowAttribute(hwnd, 36 /*DWMWA_TEXT_COLOR*/,    &CLR_TEXT,    sizeof(CLR_TEXT));
+        DwmSetWindowAttribute(hwnd, 34 /*DWMWA_BORDER_COLOR*/,  &CLR_BORDER,  sizeof(CLR_BORDER));
+    } else {
+        // Fallback: immersive dark mode (Win10 20H1+)
+        BOOL useDark = TRUE;
+        DwmSetWindowAttribute(hwnd, 19 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &useDark, sizeof(useDark));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUG WINDOW CREATION
+// ═══════════════════════════════════════════════════════════════════════════════
 void CreateDebugWindow(HINSTANCE hInst) {
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = DebugWndProc; wc.hInstance = hInst; wc.lpszClassName = L"CanvasDebugClass";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
     if (!RegisterClassExW(&wc)) return;
     g_debugHwnd = CreateWindowExW(0, L"CanvasDebugClass", L"WCWM", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 450, 650, NULL, NULL, hInst, NULL);
-    if (g_debugHwnd) ShowWindow(g_debugHwnd, SW_SHOW);
+    if (g_debugHwnd) {
+        ApplyDarkTitleBar(g_debugHwnd);
+        ShowWindow(g_debugHwnd, SW_SHOW);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
