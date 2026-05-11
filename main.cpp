@@ -4,7 +4,6 @@
 #include <algorithm>
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "shell32.lib")
-#include <algorithm>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -389,6 +388,17 @@ bool  g_btnBindHover = false;
 bool  g_btnPanHover = false;
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// GDI CACHE — Persistent GDI objects for debug window painting
+// ═══════════════════════════════════════════════════════════════════════════════
+HDC     g_hdcMem    = NULL;
+HBITMAP g_hBmp      = NULL;
+HBITMAP g_hOldBmp   = NULL;
+HBRUSH  g_hBgBrush  = NULL;
+HPEN    g_hPen      = NULL;
+HBRUSH  g_hBrushBind[3];  // [0]=NORM, [1]=HOT, [2]=ACT
+HBRUSH  g_hBrushPan[3];   // [0]=NORM, [1]=HOT, [2]=ACT
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // THEME — Catppuccin Mocha Palette
 // ═══════════════════════════════════════════════════════════════════════════════
 // All colors are straight RGB (0–255)
@@ -658,6 +668,9 @@ void HandleDoubleTapReset() {
 // ОТЛАДОЧНОЕ ОКНО
 // ═══════════════════════════════════════════════════════════════════════════════
 void UpdateDebugWindow() {
+    // Пропускаем если окно скрыто — не тратим ресурсы на формирование строки
+    if (!g_debugHwnd || !IsWindowVisible(g_debugHwnd)) return;
+
     std::wstringstream ss;
     ss << L"=== WCWM DEBUG ===\n";
     ss << L"Camera: " << g_camOffset.x << L", " << g_camOffset.y << L"\n";
@@ -717,6 +730,26 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // ─── Create persistent fonts (Segoe UI for buttons, Consolas for debug log) ───
             g_hFontBtn   = CreateFontW(12, 0, 0, 0, FW_BOLD,   0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
             g_hFontDebug = CreateFontW(13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, FIXED_PITCH|FF_MODERN, L"Consolas");
+
+            // ─── Create persistent GDI objects ───
+            {
+                HDC hdcScreen = GetDC(hwnd);
+                g_hdcMem = CreateCompatibleDC(hdcScreen);
+                // Bitmap will be created at WM_SIZE; create a small placeholder for now
+                g_hBmp = CreateCompatibleBitmap(hdcScreen, 1, 1);
+                g_hOldBmp = (HBITMAP)SelectObject(g_hdcMem, g_hBmp);
+                g_hBgBrush = CreateSolidBrush(CLR_BG);
+                g_hPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+                // Button brushes: 3 states each — NORM, HOT, ACT
+                g_hBrushBind[0] = CreateSolidBrush(CLR_BTN_BIND_NORM);
+                g_hBrushBind[1] = CreateSolidBrush(CLR_BTN_BIND_HOT);
+                g_hBrushBind[2] = CreateSolidBrush(CLR_BTN_BIND_ACT);
+                g_hBrushPan[0]  = CreateSolidBrush(CLR_BTN_PAN_NORM);
+                g_hBrushPan[1]  = CreateSolidBrush(CLR_BTN_PAN_HOT);
+                g_hBrushPan[2]  = CreateSolidBrush(CLR_BTN_PAN_ACT);
+                ReleaseDC(hwnd, hdcScreen);
+            }
+
             // Hover states default to false — harmless if window created off-screen
             g_btnBindHover = false;
             g_btnPanHover  = false;
@@ -727,6 +760,20 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // Button layout: right-aligned, 160px wide × 30px tall, 5px v-gap
             g_btnBindRect = { rc.right - 170, 10, rc.right - 10, 40 };
             g_btnPanRect  = { rc.right - 170, 45, rc.right - 10, 75 };
+
+            // Recreate offscreen bitmap for the new client size
+            if (g_hdcMem && g_hBmp) {
+                // Select old bitmap back before deleting it
+                SelectObject(g_hdcMem, g_hOldBmp);
+                DeleteObject(g_hBmp);
+                {
+                    HDC hdcScreen = GetDC(hwnd);
+                    g_hBmp = CreateCompatibleBitmap(hdcScreen, rc.right, rc.bottom);
+                    g_hOldBmp = (HBITMAP)SelectObject(g_hdcMem, g_hBmp);
+                    ReleaseDC(hwnd, hdcScreen);
+                }
+            }
+
             InvalidateRect(hwnd, NULL, FALSE);  // Force full repaint after layout update
             return 0;
         }
@@ -760,85 +807,85 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return TRUE;  // Suppress default background erase — we handle it in WM_PAINT
 
         case WM_PAINT: {
-            PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+            PAINTSTRUCT ps; BeginPaint(hwnd, &ps);
             RECT rc; GetClientRect(hwnd, &rc);
 
-            // ─── Double buffering: compatible memory DC + bitmap ───
-            HDC     hdcMem = CreateCompatibleDC(hdc);
-            HBITMAP hBmp   = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-            HBITMAP hOldBmp= (HBITMAP)SelectObject(hdcMem, hBmp);
+            // ─── Resize bitmap if needed (handles initial 1×1 placeholder) ───
+            if (g_hdcMem && g_hBmp) {
+                BITMAP bmpInfo;
+                GetObject(g_hBmp, sizeof(BITMAP), &bmpInfo);
+                if (bmpInfo.bmWidth != rc.right || bmpInfo.bmHeight != rc.bottom) {
+                    SelectObject(g_hdcMem, g_hOldBmp);
+                    DeleteObject(g_hBmp);
+                    HDC hdcScreen = GetDC(hwnd);
+                    g_hBmp = CreateCompatibleBitmap(hdcScreen, rc.right, rc.bottom);
+                    g_hOldBmp = (HBITMAP)SelectObject(g_hdcMem, g_hBmp);
+                    ReleaseDC(hwnd, hdcScreen);
+                }
+            }
 
             // ─── Background ───────────────────────────────────────
-            HBRUSH hBgBrush = CreateSolidBrush(CLR_BG);
-            FillRect(hdcMem, &rc, hBgBrush);
-            DeleteObject(hBgBrush);
+            FillRect(g_hdcMem, &rc, g_hBgBrush);
 
             // ─── Button: Set Activate ──────────────────────────────
-            COLORREF cBind = CLR_BTN_BIND_NORM;
-            if (g_bindingMode && !g_bindingPanKey)      cBind = CLR_BTN_BIND_ACT;
-            else if (g_btnBindHover && !g_bindingMode)  cBind = CLR_BTN_BIND_HOT;
+            int bindState = 0; // 0=NORM, 1=HOT, 2=ACT
+            if (g_bindingMode && !g_bindingPanKey)      bindState = 2;
+            else if (g_btnBindHover && !g_bindingMode)  bindState = 1;
 
-            HBRUSH hBrushBind = CreateSolidBrush(cBind);
-            RoundRect(hdcMem, g_btnBindRect.left, g_btnBindRect.top,
+            SelectObject(g_hdcMem, g_hBrushBind[bindState]);
+            RoundRect(g_hdcMem, g_btnBindRect.left, g_btnBindRect.top,
                             g_btnBindRect.right, g_btnBindRect.bottom, 8, 8);
 
-            // Dark border (1px black) to separate from BG
-            HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
-            HPEN hOldPen = (HPEN)SelectObject(hdcMem, hPen);
-            HBRUSH hNullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
-            HBRUSH hOldBrush = (HBRUSH)SelectObject(hdcMem, hNullBrush);
-            RoundRect(hdcMem, g_btnBindRect.left, g_btnBindRect.top,
+            // Draw border
+            HPEN hOldPen = (HPEN)SelectObject(g_hdcMem, g_hPen);
+            HBRUSH hOldBrush = (HBRUSH)SelectObject(g_hdcMem, (HBRUSH)GetStockObject(NULL_BRUSH));
+            RoundRect(g_hdcMem, g_btnBindRect.left, g_btnBindRect.top,
                             g_btnBindRect.right, g_btnBindRect.bottom, 8, 8);
-            SelectObject(hdcMem, hOldBrush);
-            SelectObject(hdcMem, hOldPen);
-            DeleteObject(hPen);
-            DeleteObject(hBrushBind);
+            SelectObject(g_hdcMem, hOldBrush);
+            SelectObject(g_hdcMem, hOldPen);
 
             // ─── Button: Set Pan Key ───────────────────────────────
-            COLORREF cPan = CLR_BTN_PAN_NORM;
-            if (g_bindingMode && g_bindingPanKey)       cPan = CLR_BTN_PAN_ACT;
-            else if (g_btnPanHover && !g_bindingMode)   cPan = CLR_BTN_PAN_HOT;
+            int panState = 0;
+            if (g_bindingMode && g_bindingPanKey)       panState = 2;
+            else if (g_btnPanHover && !g_bindingMode)   panState = 1;
 
-            HBRUSH hBrushPan = CreateSolidBrush(cPan);
-            RoundRect(hdcMem, g_btnPanRect.left, g_btnPanRect.top,
+            SelectObject(g_hdcMem, g_hBrushPan[panState]);
+            RoundRect(g_hdcMem, g_btnPanRect.left, g_btnPanRect.top,
                             g_btnPanRect.right, g_btnPanRect.bottom, 8, 8);
-            // Border
-            hOldPen   = (HPEN)SelectObject(hdcMem, hPen);
-            hOldBrush = (HBRUSH)SelectObject(hdcMem, hNullBrush);
-            RoundRect(hdcMem, g_btnPanRect.left, g_btnPanRect.top,
+            hOldPen   = (HPEN)SelectObject(g_hdcMem, g_hPen);
+            hOldBrush = (HBRUSH)SelectObject(g_hdcMem, (HBRUSH)GetStockObject(NULL_BRUSH));
+            RoundRect(g_hdcMem, g_btnPanRect.left, g_btnPanRect.top,
                             g_btnPanRect.right, g_btnPanRect.bottom, 8, 8);
-            SelectObject(hdcMem, hOldBrush);
-            SelectObject(hdcMem, hOldPen);
-            DeleteObject(hPen);        // hPen created above — safe delete after second use
-            DeleteObject(hBrushPan);
+            SelectObject(g_hdcMem, hOldBrush);
+            SelectObject(g_hdcMem, hOldPen);
+
+            // Select bind brush back (doesn't matter for correctness but keeps state clean)
+            SelectObject(g_hdcMem, g_hBrushBind[bindState]);
 
             // ─── Button Text (Segoe UI Bold) ──────────────────────
-            SetBkMode(hdcMem, TRANSPARENT);
-            SetTextColor(hdcMem, CLR_TEXT);
-            HFONT hOldFontBtn = (HFONT)SelectObject(hdcMem, g_hFontBtn);
-            DrawTextW(hdcMem, (g_bindingMode && !g_bindingPanKey) ? L"LISTENING..." : L"Set Activate",
+            SetBkMode(g_hdcMem, TRANSPARENT);
+            SetTextColor(g_hdcMem, CLR_TEXT);
+            HFONT hOldFontBtn = (HFONT)SelectObject(g_hdcMem, g_hFontBtn);
+            DrawTextW(g_hdcMem, (g_bindingMode && !g_bindingPanKey) ? L"LISTENING..." : L"Set Activate",
                       -1, &g_btnBindRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            DrawTextW(hdcMem, (g_bindingMode && g_bindingPanKey) ? L"LISTENING..." : L"Set Pan Key",
+            DrawTextW(g_hdcMem, (g_bindingMode && g_bindingPanKey) ? L"LISTENING..." : L"Set Pan Key",
                       -1, &g_btnPanRect,  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(hdcMem, hOldFontBtn);
+            SelectObject(g_hdcMem, hOldFontBtn);
 
             // ─── Debug Log Text (Consolas) ────────────────────────
-            HFONT hOldFontDbg = (HFONT)SelectObject(hdcMem, g_hFontDebug);
-            SetTextColor(hdcMem, CLR_TEXT_DIM);
+            HFONT hOldFontDbg = (HFONT)SelectObject(g_hdcMem, g_hFontDebug);
+            SetTextColor(g_hdcMem, CLR_TEXT_DIM);
             RECT tr = { 10, 85, rc.right - 10, rc.bottom - 10 };
             EnterCriticalSection(&g_debugLock);
             std::wstring t = g_debugText;
             LeaveCriticalSection(&g_debugLock);
-            DrawTextW(hdcMem, t.c_str(), -1, &tr, DT_LEFT | DT_TOP | DT_WORDBREAK);
-            SelectObject(hdcMem, hOldFontDbg);
+            DrawTextW(g_hdcMem, t.c_str(), -1, &tr, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            SelectObject(g_hdcMem, hOldFontDbg);
 
             // ─── Blit memory → screen ─────────────────────────────
-            BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdcMem, 0, 0, SRCCOPY);
-
-            // ─── Cleanup ───────────────────────────────────────────
-            SelectObject(hdcMem, hOldBmp);
-            DeleteObject(hBmp);
-            DeleteDC(hdcMem);
+            HDC hdc = GetDC(hwnd);
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, g_hdcMem, 0, 0, SRCCOPY);
+            ReleaseDC(hwnd, hdc);
 
             EndPaint(hwnd, &ps);
             return 0;
@@ -906,6 +953,23 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
 
         case WM_DESTROY:
+            // Clean up GDI objects — select original bitmap back before deleting
+            if (g_hdcMem && g_hOldBmp) {
+                SelectObject(g_hdcMem, g_hOldBmp);
+            }
+            if (g_hBmp)    { DeleteObject(g_hBmp);    g_hBmp    = NULL; }
+            if (g_hdcMem)  { DeleteDC(g_hdcMem);      g_hdcMem  = NULL; }
+            if (g_hPen)    { DeleteObject(g_hPen);     g_hPen    = NULL; }
+            if (g_hBgBrush){ DeleteObject(g_hBgBrush); g_hBgBrush= NULL; }
+            for (int i = 0; i < 3; ++i) {
+                if (g_hBrushBind[i]) { DeleteObject(g_hBrushBind[i]); g_hBrushBind[i] = NULL; }
+                if (g_hBrushPan[i])  { DeleteObject(g_hBrushPan[i]);  g_hBrushPan[i]  = NULL; }
+            }
+            // Удаляем tray icon чтобы не оставался "мёртвый" значок в трее
+            if (g_trayIcon.hWnd) {
+                Shell_NotifyIconW(NIM_DELETE, &g_trayIcon);
+                ZeroMemory(&g_trayIcon, sizeof(g_trayIcon));
+            }
             // Clean up fonts to avoid GDI leaks
             if (g_hFontBtn)   { DeleteObject(g_hFontBtn);   g_hFontBtn   = NULL; }
             if (g_hFontDebug) { DeleteObject(g_hFontDebug); g_hFontDebug = NULL; }
@@ -952,8 +1016,9 @@ void CreateDebugWindow(HINSTANCE hInst) {
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = DebugWndProc; wc.hInstance = hInst; wc.lpszClassName = L"CanvasDebugClass";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
-    wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APPICON));
-    wc.hIconSm = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APPICON));
+    HICON hAppIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APPICON));
+    wc.hIcon = hAppIcon;
+    wc.hIconSm = hAppIcon;
     if (!RegisterClassExW(&wc)) return;
     g_debugHwnd = CreateWindowExW(0, L"CanvasDebugClass", L"WCWM", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 450, 650, NULL, NULL, hInst, NULL);
     if (g_debugHwnd) {
@@ -961,14 +1026,13 @@ void CreateDebugWindow(HINSTANCE hInst) {
         ShowWindow(g_debugHwnd, SW_SHOW);
 
         // ─── Создаём иконку в системном трее ───
-        HICON hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APPICON));
         ZeroMemory(&g_trayIcon, sizeof(g_trayIcon));
         g_trayIcon.cbSize = sizeof(NOTIFYICONDATAW);
         g_trayIcon.hWnd   = g_debugHwnd;
         g_trayIcon.uID    = ID_TRAY_OPEN;
         g_trayIcon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         g_trayIcon.uCallbackMessage = WM_TRAYICON;
-        g_trayIcon.hIcon = hIcon;
+        g_trayIcon.hIcon = hAppIcon;
         wcscpy_s(g_trayIcon.szTip, L"WCWM — Window Canvas Window Manager");
         Shell_NotifyIconW(NIM_ADD, &g_trayIcon);
         // Первая попытка может не сработать — пробуем ещё раз (страховка от "зависшей" иконки)
@@ -1280,10 +1344,9 @@ void ArrangeGrid() {
 }
 
 void TakeSnapshot() {
-    EnterCriticalSection(&g_lock);
-    g_snapshots.clear();
-    g_snapshots.reserve(64);
-    SnapshotCtx ctx{&g_snapshots, g_camOffset};
+     EnterCriticalSection(&g_lock);
+     g_snapshots.clear();
+     SnapshotCtx ctx{&g_snapshots, g_camOffset};
     EnumWindows([](HWND h, LPARAM l) -> BOOL {
         if (!IsValidWnd(h)) return TRUE;
         RECT r; GetWindowRect(h, &r);
@@ -1378,299 +1441,430 @@ POINT CalculateCameraTarget(int targetAbsX, int targetAbsY, int width, int heigh
 }
 
 void WorkerFunc() {
-    auto lastWindowScan = std::chrono::steady_clock::now();
-    auto lastDebugUpdate = std::chrono::steady_clock::now();
-    
-      while (!g_stop.load()) {
-          bool camAnim = g_isCamAnim.load();
-          bool gridAnim = g_gridAnim.active;
+     auto lastWindowScan = std::chrono::steady_clock::now();
+     auto lastFullSnapshot = std::chrono::steady_clock::now();
+     auto lastDebugUpdate = std::chrono::steady_clock::now();
 
-        // ============================================================
-        // 1. ПЕРИОДИЧЕСКОЕ СКАНИРОВАНИЕ НОВЫХ ОКОН (Раз в 1 сек)
-        // ============================================================
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastWindowScan).count() >= 1000) {
-            lastWindowScan = now;
+while (!g_stop.load()) {
+            bool camAnim = g_isCamAnim.load();
+            bool gridAnim = g_gridAnim.active;
 
-            // Быстро копируем известные HWND
-            std::vector<HWND> knownHwnds;
-            {
-                EnterCriticalSection(&g_lock);
-                knownHwnds.reserve(g_snapshots.size() + g_newWindowsFound.size() + g_pendingWindows.size());
-                for (const auto& s : g_snapshots) knownHwnds.push_back(s.hwnd);
-                for (const auto& h : g_newWindowsFound) knownHwnds.push_back(h);
-                for (const auto& pw : g_pendingWindows) knownHwnds.push_back(pw.hwnd);
-                LeaveCriticalSection(&g_lock);
-            }
+           // ============================================================
+           // 1. ЛЁГКАЯ ПРОВЕРКА СУЩЕСТВОВАНИЯ ОКОН (каждый тик, ~8мс)
+           // ============================================================
+           {
+               EnterCriticalSection(&g_lock);
+               // Проверяем IsWindow для каждого снапшота; удаляем мёртвые окна
+               auto it = std::remove_if(g_snapshots.begin(), g_snapshots.end(),
+                   [](const WindowSnapshot& s) {
+                       return !s.hwnd || !IsWindow(s.hwnd);
+                   });
+               if (it != g_snapshots.end()) {
+                   g_snapshots.erase(it, g_snapshots.end());
+               }
+               LeaveCriticalSection(&g_lock);
+           }
 
-            struct ScanCtx {
-                const std::vector<HWND>* pKnown;
-                std::wstring notice;
-                HWND newHwnd;
-            };
+           // ============================================================
+           // 2. ПОЛНЫЙ СНАПШОТ + ОБНАРУЖЕНИЕ НОВЫХ ОКОН (каждые ~200мс)
+           // ============================================================
+           auto now = std::chrono::steady_clock::now();
+           if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFullSnapshot).count() >= 200) {
+               lastFullSnapshot = now;
 
-            ScanCtx ctx;
-            ctx.pKnown = &knownHwnds;
-            ctx.notice = L"";
-            ctx.newHwnd = NULL;
+               // TakeSnapshot делает EnumWindows + IsValidWnd и обновляет g_snapshots
+               TakeSnapshot();
 
-            EnumWindows([](HWND h, LPARAM l) -> BOOL {
-                if (!IsValidWnd(h)) return TRUE;
-                ScanCtx* c = reinterpret_cast<ScanCtx*>(l);
-                if (std::find(c->pKnown->begin(), c->pKnown->end(), h) != c->pKnown->end()) return TRUE;
+               // Обнаружение новых окон: сравниваем HWND из EnumWindows с текущими g_snapshots
+               {
+                   // Собираем текущие HWND из снапшотов
+                   std::vector<HWND> currentHwnds;
+                   {
+                       EnterCriticalSection(&g_lock);
+                       currentHwnds.reserve(g_snapshots.size() + g_newWindowsFound.size() + g_pendingWindows.size());
+                       for (const auto& s : g_snapshots) currentHwnds.push_back(s.hwnd);
+                       for (const auto& h : g_newWindowsFound) currentHwnds.push_back(h);
+                       for (const auto& pw : g_pendingWindows) currentHwnds.push_back(pw.hwnd);
+                       LeaveCriticalSection(&g_lock);
+                   }
 
-                wchar_t title[256] = {0};
-                GetWindowTextW(h, title, _countof(title));
-                std::wstringstream ss;
-                ss << L"[NEW] " << (title[0] ? title : L"<No Title>");
-                c->notice = ss.str();
-                c->newHwnd = h;
-                return FALSE; 
-            }, reinterpret_cast<LPARAM>(&ctx));
+                   // EnumWindows для поиска новых окон, не находящихся в текущем списке
+                   struct ScanCtx {
+                       const std::vector<HWND>* pKnown;
+                       std::wstring notice;
+                       HWND newHwnd;
+                   };
 
-            if (ctx.newHwnd != NULL) {
-                RECT r;
-                if (GetWindowRect(ctx.newHwnd, &r)) {
-                    int w = r.right - r.left;
-                    int h = r.bottom - r.top;
+                   ScanCtx ctx;
+                   ctx.pKnown = &currentHwnds;
+                   ctx.notice = L"";
+                   ctx.newHwnd = NULL;
 
-                    bool isActive = false;
-                    HWND fgWnd = GetForegroundWindow();
-                    if (fgWnd == ctx.newHwnd || GetAncestor(fgWnd, GA_ROOTOWNER) == ctx.newHwnd) {
-                        isActive = true;
-                    }
+                   EnumWindows([](HWND h, LPARAM l) -> BOOL {
+                       if (!IsValidWnd(h)) return TRUE;
+                       ScanCtx* c = reinterpret_cast<ScanCtx*>(l);
+                       if (std::find(c->pKnown->begin(), c->pKnown->end(), h) != c->pKnown->end()) return TRUE;
 
-                    EnterCriticalSection(&g_lock);
-                    
-                    if (isActive) {
-                        // АКТИВНОЕ: Отложенная стыковка
-                        POINT targetPos = FindBestSpot(ctx.newHwnd, w, h, g_snapshots, g_camOffset);
-                        PendingWindow pw;
-                        pw.hwnd = ctx.newHwnd;
-                        pw.targetAbsX = targetPos.x;
-                        pw.targetAbsY = targetPos.y;
-                        pw.width = w;
-                        pw.height = h;
-                        g_pendingWindows.push_back(pw);
+                       wchar_t title[256] = {0};
+                       GetWindowTextW(h, title, _countof(title));
+                       std::wstringstream ss;
+                       ss << L"[NEW] " << (title[0] ? title : L"<No Title>");
+                       c->notice = ss.str();
+                       c->newHwnd = h;
+                       return FALSE;
+                   }, reinterpret_cast<LPARAM>(&ctx));
 
-                        POINT camTarget = CalculateCameraTarget(targetPos.x, targetPos.y, w, h);
-                        g_camAnimStart = g_camOffset;
-                        g_camAnimTarget = camTarget;
-                        g_camAnimTime = std::chrono::steady_clock::now();
-                        g_isCamAnim.store(true);
-                        g_autoCamAnim.store(true);
+                   if (ctx.newHwnd != NULL) {
+                       RECT r;
+                       if (GetWindowRect(ctx.newHwnd, &r)) {
+                           int w = r.right - r.left;
+                           int h = r.bottom - r.top;
 
-                        LeaveCriticalSection(&g_lock);
+                           bool isActive = false;
+                           HWND fgWnd = GetForegroundWindow();
+                           if (fgWnd == ctx.newHwnd || GetAncestor(fgWnd, GA_ROOTOWNER) == ctx.newHwnd) {
+                               isActive = true;
+                           }
 
-                        std::wstring noticeMsg = ctx.notice + L" -> DEFERRED DOCKING";
-                        EnterCriticalSection(&g_debugLock);
-                        g_newWindowNotice = noticeMsg;
-                        LeaveCriticalSection(&g_debugLock);
-                    } else {
-                        // НЕАКТИВНОЕ: Сразу в сетку
-                        g_newWindowsFound.push_back(ctx.newHwnd);
-                        POINT targetPos = FindBestSpot(ctx.newHwnd, w, h, g_snapshots, g_camOffset);
+                           EnterCriticalSection(&g_lock);
 
-                        GridAnimItem newItem;
-                        newItem.hwnd = ctx.newHwnd;
-                        newItem.startX = r.left;
-                        newItem.startY = r.top;
-                        // Важно: targetPos относительные, а для анимации нужны абсолютные старт/энд
-                        newItem.endX = targetPos.x + g_camOffset.x;
-                        newItem.endY = targetPos.y + g_camOffset.y;
-                        newItem.width = w;
-                        newItem.height = h;
+                           if (isActive) {
+                               // АКТИВНОЕ: Отложенная стыковка
+                               POINT targetPos = FindBestSpot(ctx.newHwnd, w, h, g_snapshots, g_camOffset);
+                               PendingWindow pw;
+                               pw.hwnd = ctx.newHwnd;
+                               pw.targetAbsX = targetPos.x;
+                               pw.targetAbsY = targetPos.y;
+                               pw.width = w;
+                               pw.height = h;
+                               g_pendingWindows.push_back(pw);
 
-                        g_gridAnim.items.push_back(newItem);
-                        g_gridAnim.startTime = std::chrono::steady_clock::now();
-                        g_gridAnim.active = true;
+                               POINT camTarget = CalculateCameraTarget(targetPos.x, targetPos.y, w, h);
+                               g_camAnimStart = g_camOffset;
+                               g_camAnimTarget = camTarget;
+                               g_camAnimTime = std::chrono::steady_clock::now();
+                               g_isCamAnim.store(true);
+                               g_autoCamAnim.store(true);
 
-                        LeaveCriticalSection(&g_lock);
+                               LeaveCriticalSection(&g_lock);
 
-                        std::wstring noticeMsg = ctx.notice + L" -> ANIMATING TO GRID";
-                        EnterCriticalSection(&g_debugLock);
-                        g_newWindowNotice = noticeMsg;
-                        LeaveCriticalSection(&g_debugLock);
-                    }
-                }
-            }
-        }
+                               std::wstring noticeMsg = ctx.notice + L" -> DEFERRED DOCKING";
+                               EnterCriticalSection(&g_debugLock);
+                               g_newWindowNotice = noticeMsg;
+                               LeaveCriticalSection(&g_debugLock);
+                           } else {
+                               // НЕАКТИВНОЕ: Сразу в сетку
+                               g_newWindowsFound.push_back(ctx.newHwnd);
+                               POINT targetPos = FindBestSpot(ctx.newHwnd, w, h, g_snapshots, g_camOffset);
 
-         // ============================================================
-         // 2. ПОДГОТОВКА КАДРА (Сбор данных под локом)
-         // ============================================================
-         std::vector<WindowMoveOp> ops;
-         std::vector<PendingWindow> localPending;
-         std::vector<GridAnimItem> localGridItems;
-         bool localGridActive = false;
-         POINT localCamOffset = {0,0};
-         bool localCamAnim = camAnim;
-         POINT localCamStart = g_camAnimStart;
-         POINT localCamTarget = g_camAnimTarget;
-         auto localCamTime = g_camAnimTime;
-        std::vector<WindowSnapshot> localSnapshots;
+                               GridAnimItem newItem;
+                               newItem.hwnd = ctx.newHwnd;
+                               newItem.startX = r.left;
+                               newItem.startY = r.top;
+                               newItem.endX = targetPos.x + g_camOffset.x;
+                               newItem.endY = targetPos.y + g_camOffset.y;
+                               newItem.width = w;
+                               newItem.height = h;
 
-        EnterCriticalSection(&g_lock);
+                               g_gridAnim.items.push_back(newItem);
+                               g_gridAnim.startTime = std::chrono::steady_clock::now();
+                               g_gridAnim.active = true;
 
-        localCamOffset = g_camOffset;
-        
-        // Копируем снимки для отрисовки
-        localSnapshots = g_snapshots;
+                               LeaveCriticalSection(&g_lock);
 
-        // Обработка камеры
-        if (localCamAnim) {
-            auto animNow = std::chrono::steady_clock::now();
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(animNow - localCamTime).count();
-            float t = std::min(1.0f, (float)ms / CAM_ANIM_DURATION);
-            float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t);
-            
-            localCamOffset.x = (int)(localCamStart.x + (localCamTarget.x - localCamStart.x) * ease);
-            localCamOffset.y = (int)(localCamStart.y + (localCamTarget.y - localCamStart.y) * ease);
-            
-            // Обновляем глобальную камеру сразу, чтобы другие части видели актуальную
-            g_camOffset = localCamOffset; 
+                               std::wstring noticeMsg = ctx.notice + L" -> ANIMATING TO GRID";
+                               EnterCriticalSection(&g_debugLock);
+                               g_newWindowNotice = noticeMsg;
+                               LeaveCriticalSection(&g_debugLock);
+                           }
+                       }
+                   }
+               }
+           }
 
-            if (t >= 1.0f) {
-                g_isCamAnim.store(false);
-                localCamAnim = false; // Локальный флаг тоже сбрасываем
-                
-                if (!g_pendingWindows.empty()) {
-                    g_gridAnim.items.clear();
-                    g_gridAnim.startTime = std::chrono::steady_clock::now();
-                    g_gridAnim.active = true;
+           // ============================================================
+           // 2.5. ДОПОЛНИТЕЛЬНОЕ ПОЛНОЕ СКАНИРОВАНИЕ (каждые ~1000мс)
+           // ============================================================
+           if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastWindowScan).count() >= 1000) {
+               lastWindowScan = now;
 
-                    for (const auto& pw : g_pendingWindows) {
-                        if (!IsWindow(pw.hwnd)) continue;
-                        RECT r;
-                        if (!GetWindowRect(pw.hwnd, &r)) continue;
+               // Снова копируем известные HWND (после обновлений из п. 2)
+               std::vector<HWND> knownHwnds;
+               {
+                   EnterCriticalSection(&g_lock);
+                   knownHwnds.reserve(g_snapshots.size() + g_newWindowsFound.size() + g_pendingWindows.size());
+                   for (const auto& s : g_snapshots) knownHwnds.push_back(s.hwnd);
+                   for (const auto& h : g_newWindowsFound) knownHwnds.push_back(h);
+                   for (const auto& pw : g_pendingWindows) knownHwnds.push_back(pw.hwnd);
+                   LeaveCriticalSection(&g_lock);
+               }
 
-                        GridAnimItem item;
-                        item.hwnd = pw.hwnd;
-                        item.startX = r.left;
-                        item.startY = r.top;
-                        item.endX = pw.targetAbsX + localCamOffset.x;
-                        item.endY = pw.targetAbsY + localCamOffset.y;
-                        item.width = pw.width;
-                        item.height = pw.height;
-                        g_gridAnim.items.push_back(item);
-                    }
-                    g_pendingWindows.clear();
-                    g_autoCamAnim.store(false);
-                }
-            }
-         }
+               struct ScanCtx {
+                   const std::vector<HWND>* pKnown;
+                   std::wstring notice;
+                   HWND newHwnd;
+               };
 
-         // Копируем pending окна
-         localPending = g_pendingWindows;
+               ScanCtx ctx;
+               ctx.pKnown = &knownHwnds;
+               ctx.notice = L"";
+               ctx.newHwnd = NULL;
 
-         // Копируем состояние сетки
-         localGridActive = g_gridAnim.active;
-         if (localGridActive) {
-             localGridItems = g_gridAnim.items;
-         }
+               EnumWindows([](HWND h, LPARAM l) -> BOOL {
+                   if (!IsValidWnd(h)) return TRUE;
+                   ScanCtx* c = reinterpret_cast<ScanCtx*>(l);
+                   if (std::find(c->pKnown->begin(), c->pKnown->end(), h) != c->pKnown->end()) return TRUE;
 
-          LeaveCriticalSection(&g_lock); // ОСВОБОЖДАЕМ ЛОК ЗДЕСЬ! Дальше только вычисления и рендер
+                   wchar_t title[256] = {0};
+                   GetWindowTextW(h, title, _countof(title));
+                   std::wstringstream ss;
+                   ss << L"[NEW] " << (title[0] ? title : L"<No Title>");
+                   c->notice = ss.str();
+                   c->newHwnd = h;
+                   return FALSE;
+               }, reinterpret_cast<LPARAM>(&ctx));
+
+               if (ctx.newHwnd != NULL) {
+                   RECT r;
+                   if (GetWindowRect(ctx.newHwnd, &r)) {
+                       int w = r.right - r.left;
+                       int h = r.bottom - r.top;
+
+                       bool isActive = false;
+                       HWND fgWnd = GetForegroundWindow();
+                       if (fgWnd == ctx.newHwnd || GetAncestor(fgWnd, GA_ROOTOWNER) == ctx.newHwnd) {
+                           isActive = true;
+                       }
+
+                       EnterCriticalSection(&g_lock);
+
+                       if (isActive) {
+                           POINT targetPos = FindBestSpot(ctx.newHwnd, w, h, g_snapshots, g_camOffset);
+                           PendingWindow pw;
+                           pw.hwnd = ctx.newHwnd;
+                           pw.targetAbsX = targetPos.x;
+                           pw.targetAbsY = targetPos.y;
+                           pw.width = w;
+                           pw.height = h;
+                           g_pendingWindows.push_back(pw);
+
+                           POINT camTarget = CalculateCameraTarget(targetPos.x, targetPos.y, w, h);
+                           g_camAnimStart = g_camOffset;
+                           g_camAnimTarget = camTarget;
+                           g_camAnimTime = std::chrono::steady_clock::now();
+                           g_isCamAnim.store(true);
+                           g_autoCamAnim.store(true);
+
+                           LeaveCriticalSection(&g_lock);
+
+                           std::wstring noticeMsg = ctx.notice + L" -> DEFERRED DOCKING";
+                           EnterCriticalSection(&g_debugLock);
+                           g_newWindowNotice = noticeMsg;
+                           LeaveCriticalSection(&g_debugLock);
+                       } else {
+                           g_newWindowsFound.push_back(ctx.newHwnd);
+                           POINT targetPos = FindBestSpot(ctx.newHwnd, w, h, g_snapshots, g_camOffset);
+
+                           GridAnimItem newItem;
+                           newItem.hwnd = ctx.newHwnd;
+                           newItem.startX = r.left;
+                           newItem.startY = r.top;
+                           newItem.endX = targetPos.x + g_camOffset.x;
+                           newItem.endY = targetPos.y + g_camOffset.y;
+                           newItem.width = w;
+                           newItem.height = h;
+
+                           g_gridAnim.items.push_back(newItem);
+                           g_gridAnim.startTime = std::chrono::steady_clock::now();
+                           g_gridAnim.active = true;
+
+                           LeaveCriticalSection(&g_lock);
+
+                           std::wstring noticeMsg = ctx.notice + L" -> ANIMATING TO GRID";
+                           EnterCriticalSection(&g_debugLock);
+                           g_newWindowNotice = noticeMsg;
+                           LeaveCriticalSection(&g_debugLock);
+                       }
+                   }
+               }
+           }
+
 
           // ============================================================
-          // 3. ВЫЧИСЛЕНИЕ ПОЗИЦИЙ И ОТРИСОВКА (БЕЗ ЛОКА)
+          // 3. ПОДГОТОВКА КАДРА (Сбор данных под локом)
           // ============================================================
+          std::vector<WindowMoveOp> ops;
+          std::vector<PendingWindow> localPending;
+          std::vector<GridAnimItem> localGridItems;
+          bool localGridActive = false;
+          POINT localCamOffset = {0,0};
+          bool localCamAnim = camAnim;
+          POINT localCamStart = g_camAnimStart;
+          POINT localCamTarget = g_camAnimTarget;
+          auto localCamTime = g_camAnimTime;
+         std::vector<WindowSnapshot> localSnapshots;
 
-          int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
-          int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
+         EnterCriticalSection(&g_lock);
 
-         // 3.A Отрисовка Pending окон (висят в центре)
-         for (const auto& pw : localPending) {
-             if (!IsWindow(pw.hwnd)) continue;
-             ops.push_back({pw.hwnd, screenCx - pw.width / 2, screenCy - pw.height / 2, pw.width, pw.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
-         }
+         localCamOffset = g_camOffset;
 
-         // 3.B Отрисовка анимации сетки
-         if (localGridActive) {
+         // Копируем снимки для отрисовки
+         localSnapshots = g_snapshots;
+
+         // Обработка камеры
+         if (localCamAnim) {
              auto animNow = std::chrono::steady_clock::now();
-             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(animNow - g_gridAnim.startTime).count();
-             float t = std::min(1.0f, (float)ms / g_gridAnim.durationMs);
+             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(animNow - localCamTime).count();
+             float t = std::min(1.0f, (float)ms / CAM_ANIM_DURATION);
              float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t);
 
-             for (const auto& item : localGridItems) {
-                 if (!IsWindow(item.hwnd)) continue;
-                 int curX = (int)(item.startX + (item.endX - item.startX) * ease);
-                 int curY = (int)(item.startY + (item.endY - item.startY) * ease);
-                 ops.push_back({item.hwnd, curX, curY, item.width, item.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
-             }
+             localCamOffset.x = (int)(localCamStart.x + (localCamTarget.x - localCamStart.x) * ease);
+             localCamOffset.y = (int)(localCamStart.y + (localCamTarget.y - localCamStart.y) * ease);
+
+             // Обновляем глобальную камеру сразу, чтобы другие части видели актуальную
+             g_camOffset = localCamOffset;
 
              if (t >= 1.0f) {
-                 EnterCriticalSection(&g_lock);
-                 g_gridAnim.active = false;
-                 for (const auto& item : g_gridAnim.items) {
-                     if (!IsWindow(item.hwnd)) continue;
-                     bool exists = false;
-                     for (const auto& s : g_snapshots) {
-                         if (s.hwnd == item.hwnd) { exists = true; break; }
+                 g_isCamAnim.store(false);
+                 localCamAnim = false; // Локальный флаг тоже сбрасываем
+
+                 if (!g_pendingWindows.empty()) {
+                     g_gridAnim.items.clear();
+                     g_gridAnim.startTime = std::chrono::steady_clock::now();
+                     g_gridAnim.active = true;
+
+                     for (const auto& pw : g_pendingWindows) {
+                         if (!IsWindow(pw.hwnd)) continue;
+                         RECT r;
+                         if (!GetWindowRect(pw.hwnd, &r)) continue;
+
+                         GridAnimItem item;
+                         item.hwnd = pw.hwnd;
+                         item.startX = r.left;
+                         item.startY = r.top;
+                         item.endX = pw.targetAbsX + localCamOffset.x;
+                         item.endY = pw.targetAbsY + localCamOffset.y;
+                         item.width = pw.width;
+                         item.height = pw.height;
+                         g_gridAnim.items.push_back(item);
                      }
-                     if (!exists) {
-                         int relativeX = item.endX - g_camOffset.x;
-                         int relativeY = item.endY - g_camOffset.y;
-                         g_snapshots.push_back({item.hwnd, relativeX, relativeY, item.width, item.height});
-                     }
-                     auto it = std::find(g_newWindowsFound.begin(), g_newWindowsFound.end(), item.hwnd);
-                     if (it != g_newWindowsFound.end()) {
-                         g_newWindowsFound.erase(it);
-                     }
-                 }
-                 g_gridAnim.items.clear();
-                 LeaveCriticalSection(&g_lock);
-             }
-         }
-
-         // 3.C Обработка перетаскивания (delta-accumulation)
-         bool cameraMoved = false; // Флаг: камера реально сдвинулась в этом кадре
-
-         // ВАЖНО: Проверяем g_isDragging напрямую, а не через localDrag
-         // Это предотвращает применение дельты после отпускания кнопки
-         if (g_isDragging.load() && !g_gridAnim.active) {
-             // Атомарно извлекаем накопленную дельту (exchange обнуляет аккумулятор)
-             long dx = g_mouseDeltaX.exchange(0, std::memory_order_relaxed);
-             long dy = g_mouseDeltaY.exchange(0, std::memory_order_relaxed);
-
-             // Применяем дельту ТОЛЬКО если она ненулевая
-             if (dx != 0 || dy != 0) {
-                 EnterCriticalSection(&g_lock);
-                 // ВАЖНО: Инвертируем дельту! Мышь вправо → камера влево
-                 // Это создает эффект "тяги" контента за курсором
-                 int newX = g_camOffset.x + (int)dx;
-                 int newY = g_camOffset.y + (int)dy;
-                 g_camOffset.x = std::max(-5000, std::min(newX, CANVAS_WIDTH + 5000));
-                 g_camOffset.y = std::max(-5000, std::min(newY, CANVAS_HEIGHT + 5000));
-                 localCamOffset = g_camOffset;
-                 LeaveCriticalSection(&g_lock);
-                 cameraMoved = true; // Камера сдвинулась!
-             }
-         }
-
-         // 3.D Отрисовка обычных окон (если не идет анимация сетки)
-         if (!localGridActive) {
-             // Двигаем окна ТОЛЬКО если камера реально сдвинулась или идет анимация
-             if (cameraMoved || localCamAnim) {
-                 // КРИТИЧНО: Валидируем каждое окно перед использованием
-                 // localSnapshots — это копия, но окна могли закрыться между копированием и использованием
-                 for (auto& s : localSnapshots) {
-                     // ЗАЩИТА: Проверяем существование окна ПЕРЕД использованием
-                     if (!s.hwnd || !IsWindow(s.hwnd)) continue;
-
-                     int targetX = s.baseX + localCamOffset.x;
-                     int targetY = s.baseY + localCamOffset.y;
-
-                     // Ограничиваем координаты
-                     targetX = std::max(-5000, std::min(targetX, CANVAS_WIDTH + 5000));
-                     targetY = std::max(-5000, std::min(targetY, CANVAS_HEIGHT + 5000));
-
-                     // Двигаем окно без дополнительных проверок (для минимальной задержки)
-                     ops.push_back({s.hwnd, targetX, targetY, s.width, s.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
+                     g_pendingWindows.clear();
+                     g_autoCamAnim.store(false);
                  }
              }
-         }
+          }
 
-        if (!ops.empty()) ApplyMoves(ops);
+          // Копируем pending окна
+          localPending = g_pendingWindows;
+
+          // Копируем состояние сетки
+          localGridActive = g_gridAnim.active;
+          if (localGridActive) {
+              localGridItems = g_gridAnim.items;
+          }
+
+           LeaveCriticalSection(&g_lock); // ОСВОБОЖДАЕМ ЛОК ЗДЕСЬ! Дальше только вычисления и рендер
+
+           // ============================================================
+           // 4. ВЫЧИСЛЕНИЕ ПОЗИЦИЙ И ОТРИСОВКА (БЕЗ ЛОКА)
+           // ============================================================
+
+           int screenCx = GetSystemMetrics(SM_CXSCREEN) / 2;
+           int screenCy = GetSystemMetrics(SM_CYSCREEN) / 2;
+
+          // 4.A Отрисовка Pending окон (висят в центре)
+          for (const auto& pw : localPending) {
+              if (!IsWindow(pw.hwnd)) continue;
+              ops.push_back({pw.hwnd, screenCx - pw.width / 2, screenCy - pw.height / 2, pw.width, pw.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
+          }
+
+          // 4.B Отрисовка анимации сетки
+          if (localGridActive) {
+              auto animNow = std::chrono::steady_clock::now();
+              auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(animNow - g_gridAnim.startTime).count();
+              float t = std::min(1.0f, (float)ms / g_gridAnim.durationMs);
+              float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t);
+
+              for (const auto& item : localGridItems) {
+                  if (!IsWindow(item.hwnd)) continue;
+                  int curX = (int)(item.startX + (item.endX - item.startX) * ease);
+                  int curY = (int)(item.startY + (item.endY - item.startY) * ease);
+                  ops.push_back({item.hwnd, curX, curY, item.width, item.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
+              }
+
+              if (t >= 1.0f) {
+                  EnterCriticalSection(&g_lock);
+                  g_gridAnim.active = false;
+                  for (const auto& item : g_gridAnim.items) {
+                      if (!IsWindow(item.hwnd)) continue;
+                      bool exists = false;
+                      for (const auto& s : g_snapshots) {
+                          if (s.hwnd == item.hwnd) { exists = true; break; }
+                      }
+                      if (!exists) {
+                          int relativeX = item.endX - g_camOffset.x;
+                          int relativeY = item.endY - g_camOffset.y;
+                          g_snapshots.push_back({item.hwnd, relativeX, relativeY, item.width, item.height});
+                      }
+                      auto it = std::find(g_newWindowsFound.begin(), g_newWindowsFound.end(), item.hwnd);
+                      if (it != g_newWindowsFound.end()) {
+                          g_newWindowsFound.erase(it);
+                      }
+                  }
+                  g_gridAnim.items.clear();
+                  LeaveCriticalSection(&g_lock);
+              }
+          }
+
+          // 4.C Обработка перетаскивания (delta-accumulation)
+          bool cameraMoved = false; // Флаг: камера реально сдвинулась в этом кадре
+
+          // ВАЖНО: Проверяем g_isDragging напрямую, а не через localDrag
+          // Это предотвращает применение дельты после отпускания кнопки
+          if (g_isDragging.load() && !g_gridAnim.active) {
+              // Атомарно извлекаем накопленную дельту (exchange обнуляет аккумулятор)
+              long dx = g_mouseDeltaX.exchange(0, std::memory_order_relaxed);
+              long dy = g_mouseDeltaY.exchange(0, std::memory_order_relaxed);
+
+              // Применяем дельту ТОЛЬКО если она ненулевая
+              if (dx != 0 || dy != 0) {
+                  EnterCriticalSection(&g_lock);
+                  // ВАЖНО: Инвертируем дельту! Мышь вправо → камера влево
+                  // Это создает эффект "тяги" контента за курсором
+                  int newX = g_camOffset.x + (int)dx;
+                  int newY = g_camOffset.y + (int)dy;
+                  g_camOffset.x = std::max(-5000, std::min(newX, CANVAS_WIDTH + 5000));
+                  g_camOffset.y = std::max(-5000, std::min(newY, CANVAS_HEIGHT + 5000));
+                  localCamOffset = g_camOffset;
+                  LeaveCriticalSection(&g_lock);
+                  cameraMoved = true; // Камера сдвинулась!
+              }
+          }
+
+          // 4.D Отрисовка обычных окон (если не идет анимация сетки)
+          if (!localGridActive) {
+              // Двигаем окна ТОЛЬКО если камера реально сдвинулась или идет анимация
+              if (cameraMoved || localCamAnim) {
+                  // КРИТИЧНО: Валидируем каждое окно перед использованием
+                  // localSnapshots — это копия, но окна могли закрыться между копированием и использованием
+                  for (auto& s : localSnapshots) {
+                      // ЗАЩИТА: Проверяем существование окна ПЕРЕД использованием
+                      if (!s.hwnd || !IsWindow(s.hwnd)) continue;
+
+                      int targetX = s.baseX + localCamOffset.x;
+                      int targetY = s.baseY + localCamOffset.y;
+
+                      // Ограничиваем координаты
+                      targetX = std::max(-5000, std::min(targetX, CANVAS_WIDTH + 5000));
+                      targetY = std::max(-5000, std::min(targetY, CANVAS_HEIGHT + 5000));
+
+                      // Двигаем окно без дополнительных проверок (для минимальной задержки)
+                      ops.push_back({s.hwnd, targetX, targetY, s.width, s.height, SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSIZE});
+                  }
+              }
+          }
+
+         if (!ops.empty()) ApplyMoves(ops);
 
         // ============================================================
         // 4. АНИМАЦИЯ ЗУМА
@@ -2158,54 +2352,70 @@ bool PushWindowRecursive(size_t windowIdx, std::vector<PhysicsWindow>& windows,
     return true;
 }
 
+// Бинарный поиск максимального безопасного шага движения без коллизий
+// Возвращает максимальный шаг в диапазоне [0, maxSteps], при котором нет коллизий
+int BinaryFindMaxSafeStep(const PhysicsWindow& win, const std::vector<PhysicsWindow>& windows,
+                          float ndx, float ndy, int maxSteps, int gap) {
+    if (maxSteps <= 0) return 0;
+
+    // Проверяем, свободен ли целевой шаг (быстрая оптимизация)
+    auto hasCollisionAtStep = [&](int step) -> bool {
+        int newX = win.x + (int)(ndx * step);
+        int newY = win.y + (int)(ndy * step);
+        for (const auto& other : windows) {
+            if (other.hwnd == win.hwnd) continue;
+            if (CheckCollision(newX, newY, win.w, win.h,
+                               other.x, other.y, other.w, other.h, gap)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Если уже на нулевом шаге есть коллизия — возвращаем 0
+    if (hasCollisionAtStep(0)) return 0;
+
+    // Если последний шаг свободен — возвращаем maxSteps
+    if (!hasCollisionAtStep(maxSteps)) return maxSteps;
+
+    // Бинарный поиск: ищем последний свободный шаг
+    int lo = 0, hi = maxSteps;
+    while (lo < hi - 1) {
+        int mid = lo + (hi - lo) / 2;
+        if (!hasCollisionAtStep(mid)) {
+            lo = mid; // mid свободен, ищем правее
+        } else {
+            hi = mid; // mid занят, ищем левее
+        }
+    }
+    return lo; // lo — последний безопасный шаг
+}
+
 // Притягивание окна к центру при уменьшении
-void PullWindowToCenter(PhysicsWindow& win, const std::vector<PhysicsWindow>& windows, 
+void PullWindowToCenter(PhysicsWindow& win, const std::vector<PhysicsWindow>& windows,
                         int centerX, int centerY) {
     const int GAP = 2;
-    
+
     // Вычисляем направление к центру
     int dx = centerX - win.centerX;
     int dy = centerY - win.centerY;
-    
+
     if (dx == 0 && dy == 0) return; // Уже в центре
-    
+
     // Нормализуем направление
     float len = std::sqrt(1.0f * dx * dx + 1.0f * dy * dy);
     float ndx = dx / len;
     float ndy = dy / len;
-    
-    // Пробуем двигаться к центру пиксель за пикселем
+
     int maxSteps = (int)len;
-    for (int step = 0; step < maxSteps; ++step) {
-        int newX = win.x + (int)(ndx * (step + 1));
-        int newY = win.y + (int)(ndy * (step + 1));
-        
-        // Проверяем минимальный зазор до всех окон
-        int minGap = INT_MAX;
-        for (const auto& other : windows) {
-            if (other.hwnd == win.hwnd) continue;
-            int gap = CalculateGap(newX, win.y, win.w, win.h,
-                                  other.x, other.y, other.w, other.h);
-            if (gap < minGap) minGap = gap;
-        }
-        
-        // Если зазор стал меньше 2px — останавливаемся
-        if (minGap < GAP) {
-            if (step > 0) {
-                win.x += (int)(ndx * step);
-                win.y += (int)(ndy * step);
-                win.centerX = win.x + win.w / 2;
-                win.centerY = win.y + win.h / 2;
-            }
-            return;
-        }
+    int safeStep = BinaryFindMaxSafeStep(win, windows, ndx, ndy, maxSteps, GAP);
+
+    if (safeStep > 0) {
+        win.x += (int)(ndx * safeStep);
+        win.y += (int)(ndy * safeStep);
+        win.centerX = win.x + win.w / 2;
+        win.centerY = win.y + win.h / 2;
     }
-    
-    // Если дошли сюда — можем двигаться на всё расстояние
-    win.x += dx;
-    win.y += dy;
-    win.centerX = centerX;
-    win.centerY = centerY;
 }
 
 // Разрешение коллизий после зума
@@ -2299,79 +2509,32 @@ void ResolveCollisionsAfterZoom(bool isZoomIn) {
             }
         }
     } else {
-        // ПРИ УМЕНЬШЕНИИ: итеративно притягиваем от ближайших к дальним
-        // Вычисляем расстояния для всех окон
+        // ПРИ УМЕНЬШЕНИИ: притягиваем окна к центру с помощью бинарного поиска
+        const PhysicsWindow& centerWin = physWindows[centerPhysIdx];
         for (size_t i = 0; i < physWindows.size(); ++i) {
             if (i == centerPhysIdx) continue;
-            
-            const PhysicsWindow& centerWin = physWindows[centerPhysIdx];
-            long long dx = physWindows[i].centerX - centerWin.centerX;
-            long long dy = physWindows[i].centerY - centerWin.centerY;
-            physWindows[i].distFromCenter = dx * dx + dy * dy;
-        }
-        
-        // Сортируем по расстоянию (ближайшие первыми)
-        std::vector<size_t> indices;
-        for (size_t i = 0; i < physWindows.size(); ++i) {
-            if (i != centerPhysIdx) indices.push_back(i);
-        }
-        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-            return physWindows[a].distFromCenter < physWindows[b].distFromCenter;
-        });
-        
-        // Притягиваем по очереди
-        const PhysicsWindow& centerWin = physWindows[centerPhysIdx];
-        for (size_t idx : indices) {
-            PhysicsWindow& win = physWindows[idx];
-            
+            PhysicsWindow& win = physWindows[i];
+
             // Вычисляем направление к центру
             int dx = centerWin.centerX - win.centerX;
             int dy = centerWin.centerY - win.centerY;
-            
+
             if (dx == 0 && dy == 0) continue;
-            
+
             // Нормализуем
             float len = std::sqrt(1.0f * dx * dx + 1.0f * dy * dy);
             float ndx = dx / len;
             float ndy = dy / len;
-            
-            // Пробуем двигаться к центру пиксель за пикселем
+
             int maxSteps = (int)len;
-            for (int step = 1; step <= maxSteps; ++step) {
-                int newX = win.x + (int)(ndx * step);
-                int newY = win.y + (int)(ndy * step);
-                
-                // Проверяем коллизии со всеми окнами
-                bool hasCollision = false;
-                for (const auto& other : physWindows) {
-                    if (other.hwnd == win.hwnd) continue;
-                    if (CheckCollision(newX, newY, win.w, win.h,
-                                     other.x, other.y, other.w, other.h, GAP)) {
-                        hasCollision = true;
-                        break;
-                    }
-                }
-                
-                if (hasCollision) {
-                    // Применяем предыдущий шаг (если был)
-                    if (step > 1) {
-                        win.x += (int)(ndx * (step - 1));
-                        win.y += (int)(ndy * (step - 1));
-                        win.centerX = win.x + win.w / 2;
-                        win.centerY = win.y + win.h / 2;
-                        hadChanges = true;
-                    }
-                    break;
-                }
-                
-                // Если дошли до конца — применяем полное смещение
-                if (step == maxSteps) {
-                    win.x = newX;
-                    win.y = newY;
-                    win.centerX = win.x + win.w / 2;
-                    win.centerY = win.y + win.h / 2;
-                    hadChanges = true;
-                }
+            int safeStep = BinaryFindMaxSafeStep(win, physWindows, ndx, ndy, maxSteps, GAP);
+
+            if (safeStep > 0) {
+                win.x += (int)(ndx * safeStep);
+                win.y += (int)(ndy * safeStep);
+                win.centerX = win.x + win.w / 2;
+                win.centerY = win.y + win.h / 2;
+                hadChanges = true;
             }
         }
     }
@@ -2536,9 +2699,15 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
      }
 
     // --- СОСТОЯНИЕ 2: МЫ НЕ ТАЩИМ (IDLE) -> ПРОВЕРЯЕМ ЗАПУСК ---
-    
+
     if (g_gridAnim.active) {
         return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+    }
+
+    // Кешируем состояние клавиши активации один раз на весь вызов хука
+    bool isActivateHeld = false;
+    if (g_activateKey != 0) {
+        if (GetAsyncKeyState(g_activateKey) & 0x8000) isActivateHeld = true;
     }
 
     // Проверяем, является ли текущее событие НАЖАТИЕМ кнопки
@@ -2548,33 +2717,25 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
     if (wParam == WM_LBUTTONDOWN) { isPressEvent = true; pressedKey = VK_LBUTTON; }
     else if (wParam == WM_RBUTTONDOWN) { isPressEvent = true; pressedKey = VK_RBUTTON; }
     else if (wParam == WM_MBUTTONDOWN) { isPressEvent = true; pressedKey = VK_MBUTTON; }
-    else if (wParam == WM_XBUTTONDOWN) { 
-        isPressEvent = true; 
-        pressedKey = (HIWORD(m->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2; 
+    else if (wParam == WM_XBUTTONDOWN) {
+        isPressEvent = true;
+        pressedKey = (HIWORD(m->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
     }
 
     if (isPressEvent) {
         bool shouldStartDrag = false;
 
         // ЛОГИКА ЗАПУСКА (Два независимых условия):
-        
+
         // 1. Нажата назначенная клавиша Pan Key (если она != 0)
         if (g_panKey != 0 && pressedKey == g_panKey) {
             shouldStartDrag = true;
         }
-        
+
         // 2. Комбо: Нажата клавиша Активации (Ctrl) + СРЕДНЯЯ кнопка мыши
         // Работает ВСЕГДА, независимо от Pan Key
-        if (pressedKey == VK_MBUTTON) {
-            // Проверяем, зажата ли клавиша активации в момент нажатия средней кнопки
-            bool isActivateHeld = false;
-            if (g_activateKey != 0) {
-                if (GetAsyncKeyState(g_activateKey) & 0x8000) isActivateHeld = true;
-            }
-            
-            if (isActivateHeld) {
-                shouldStartDrag = true;
-            }
+        if (pressedKey == VK_MBUTTON && isActivateHeld) {
+            shouldStartDrag = true;
         }
 
         if (shouldStartDrag) {
@@ -2587,11 +2748,7 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
     // ========================================================================
     // 3. ОБРАБОТКА АКТИВАЦИИ (Зум и Фокус)
     // ========================================================================
-    
-    bool isActivateHeld = false;
-    if (g_activateKey != 0) {
-        if (GetAsyncKeyState(g_activateKey) & 0x8000) isActivateHeld = true;
-    }
+    // isActivateHeld уже кеширована выше
 
     if (isActivateHeld) {
         if (wParam == WM_LBUTTONDOWN) {
@@ -2663,6 +2820,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CREATE) {
         InitializeCriticalSection(&g_lock);
         InitializeCriticalSection(&g_debugLock);
+        g_snapshots.reserve(128);
         g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, NULL, 0);
         g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbHook, NULL, 0);
         if (!g_mouseHook || !g_kbHook) { MessageBoxW(NULL, L"Hook Error", L"Error", MB_ICONERROR); return -1; }
@@ -2721,7 +2879,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     ShowWindow(g_hwnd, SW_SHOW);
 
     CreateDebugWindow(hInstance);
-    Sleep(100);
     ArrangeGrid();
 
     MSG msg;

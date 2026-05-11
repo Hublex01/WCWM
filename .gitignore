@@ -2,9 +2,4 @@ Nothing needs to be added to .gitignore since only a source code file (main.cpp)
 Идеи.txt
 AGENTS.md
 app_icon.ico
-.kilo/agent/architecture.md
-.kilo/agent/code.md
-.kilo/agent/debugger.md
-.kilo/command/build.md
-.kilo/command/workflow-icon.md
-.kilo/plans/1778479108818-lucky-engine.md
+.kilo
