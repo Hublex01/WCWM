@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <shlobj.h>
 #include <cstdio>
+#include "resource.h"
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -880,6 +881,8 @@ void CreateDebugWindow(HINSTANCE hInst) {
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = DebugWndProc; wc.hInstance = hInst; wc.lpszClassName = L"CanvasDebugClass";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
+    wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APPICON));
+    wc.hIconSm = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APPICON));
     if (!RegisterClassExW(&wc)) return;
     g_debugHwnd = CreateWindowExW(0, L"CanvasDebugClass", L"WCWM", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 450, 650, NULL, NULL, hInst, NULL);
     if (g_debugHwnd) {
@@ -2608,7 +2611,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int) {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
     // ═══════════════════════════════════════════════════════════════════════════════
     // ПРОВЕРКА ЕДИНОГО ЭКЗЕМПЛЯРА — ПЕРВЫМ ДЕЛОМ
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -2625,14 +2628,14 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE, LPSTR, int) {
     g_panKey = g_config.panKey;
 
     WNDCLASSEXW wcMain = {sizeof(wcMain)};
-    wcMain.lpfnWndProc = WndProc; wcMain.hInstance = h; wcMain.lpszClassName = L"CanvasDesk";
+    wcMain.lpfnWndProc = WndProc; wcMain.hInstance = hInstance; wcMain.lpszClassName = L"CanvasDesk";
     RegisterClassExW(&wcMain);
-    g_hwnd = CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"CanvasDesk", L"", WS_POPUP, 0,0,1,1, NULL,NULL,h,NULL);
+    g_hwnd = CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"CanvasDesk", L"", WS_POPUP, 0,0,1,1, NULL,NULL,hInstance,NULL);
     if (!g_hwnd) return 1;
     SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
     ShowWindow(g_hwnd, SW_SHOW);
 
-    CreateDebugWindow(h);
+    CreateDebugWindow(hInstance);
     Sleep(100);
     ArrangeGrid();
 
