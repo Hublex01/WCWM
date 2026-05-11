@@ -716,6 +716,7 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // Button layout: right-aligned, 160px wide × 30px tall, 5px v-gap
             g_btnBindRect = { rc.right - 170, 10, rc.right - 10, 40 };
             g_btnPanRect  = { rc.right - 170, 45, rc.right - 10, 75 };
+            InvalidateRect(hwnd, NULL, FALSE);  // Force full repaint after layout update
             return 0;
         }
 
