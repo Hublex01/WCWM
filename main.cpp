@@ -3,6 +3,7 @@
 #include <vector>
 #include <algorithm>
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "shell32.lib")
 #include <algorithm>
 #include <atomic>
 #include <thread>
@@ -17,6 +18,15 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ТРЕЙ ИКОНКА — ID и глобальная структура
+// ═══════════════════════════════════════════════════════════════════════════════
+#define ID_TRAY_OPEN  1001
+#define ID_TRAY_EXIT  1002
+#define WM_TRAYICON   (WM_USER + 1)
+
+NOTIFYICONDATAW g_trayIcon = {sizeof(NOTIFYICONDATAW)};
 // ═══════════════════════════════════════════════════════════════════════════════
 // КОНФИГУРАЦИЯ
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -834,12 +844,73 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         }
 
+        case WM_CLOSE:
+            // Скрываем окно вместо уничтожения — остаёмся в трее
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+
+        case WM_COMMAND: {
+            WORD cmd = LOWORD(wParam);
+            if (cmd == ID_TRAY_OPEN) {
+                // Восстанавливаем окно из трея
+                ShowWindow(hwnd, SW_SHOW);
+                if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+                return 0;
+            }
+            if (cmd == ID_TRAY_EXIT) {
+                // Полное завершение приложения с очисткой ресурсов
+                if (g_trayIcon.hWnd) {
+                    Shell_NotifyIconW(NIM_DELETE, &g_trayIcon);
+                    ZeroMemory(&g_trayIcon, sizeof(g_trayIcon));
+                }
+                if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = NULL; }
+                if (g_kbHook)   { UnhookWindowsHookEx(g_kbHook);   g_kbHook   = NULL; }
+                g_stop.store(true);
+                if (g_worker.joinable()) g_worker.join();
+                DeleteCriticalSection(&g_lock);
+                DeleteCriticalSection(&g_debugLock);
+                if (g_hSingleInstanceMutex) { CloseHandle(g_hSingleInstanceMutex); g_hSingleInstanceMutex = NULL; }
+                // Сохраняем конфиг перед выходом
+                g_config.activateKey = g_activateKey;
+                g_config.panKey = g_panKey;
+                SaveConfig(g_config);
+                DestroyWindow(hwnd);
+                PostQuitMessage(0);
+                return 0;
+            }
+            return 0;
+        }
+
+        case WM_TRAYICON:
+            if (lParam == WM_RBUTTONUP) {
+                // Показываем контекстное меню у курсора
+                HMENU hMenu = CreatePopupMenu();
+                AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN,  L"Open");
+                AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT,  L"Exit");
+                POINT pt;
+                GetCursorPos(&pt);
+                SetForegroundWindow(hwnd); // Ensure our window is foreground before menu
+                TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+                DestroyMenu(hMenu);
+                PostMessageW(hwnd, WM_NULL, 0, 0); // Prevent menu from sticking
+                return 0;
+            }
+            if (lParam == WM_LBUTTONDBLCLK) {
+                // Двойной клик — показать окно
+                ShowWindow(hwnd, SW_SHOW);
+                if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+                return 0;
+            }
+            return 0;
+
         case WM_DESTROY:
             // Clean up fonts to avoid GDI leaks
             if (g_hFontBtn)   { DeleteObject(g_hFontBtn);   g_hFontBtn   = NULL; }
             if (g_hFontDebug) { DeleteObject(g_hFontDebug); g_hFontDebug = NULL; }
             g_debugHwnd = NULL;
-            PostQuitMessage(0);
+            // NOT calling PostQuitMessage here — app continues with overlay only
             return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -888,6 +959,20 @@ void CreateDebugWindow(HINSTANCE hInst) {
     if (g_debugHwnd) {
         ApplyDarkTitleBar(g_debugHwnd);
         ShowWindow(g_debugHwnd, SW_SHOW);
+
+        // ─── Создаём иконку в системном трее ───
+        HICON hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APPICON));
+        ZeroMemory(&g_trayIcon, sizeof(g_trayIcon));
+        g_trayIcon.cbSize = sizeof(NOTIFYICONDATAW);
+        g_trayIcon.hWnd   = g_debugHwnd;
+        g_trayIcon.uID    = ID_TRAY_OPEN;
+        g_trayIcon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        g_trayIcon.uCallbackMessage = WM_TRAYICON;
+        g_trayIcon.hIcon = hIcon;
+        wcscpy_s(g_trayIcon.szTip, L"WCWM — Window Canvas Window Manager");
+        Shell_NotifyIconW(NIM_ADD, &g_trayIcon);
+        // Первая попытка может не сработать — пробуем ещё раз (страховка от "зависшей" иконки)
+        Shell_NotifyIconW(NIM_MODIFY, &g_trayIcon);
     }
 }
 
