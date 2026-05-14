@@ -1020,7 +1020,9 @@ void CreateDebugWindow(HINSTANCE hInst) {
     wc.hIcon = hAppIcon;
     wc.hIconSm = hAppIcon;
     if (!RegisterClassExW(&wc)) return;
-    g_debugHwnd = CreateWindowExW(0, L"CanvasDebugClass", L"WCWM", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 450, 650, NULL, NULL, hInst, NULL);
+    int posX = (GetSystemMetrics(SM_CXSCREEN) - 800) / 2;
+    int posY = (GetSystemMetrics(SM_CYSCREEN) / 2);
+    g_debugHwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"CanvasDebugClass", L"WCWM", WS_POPUP, posX, posY, 800, 370, NULL, NULL, hInst, NULL);
     if (g_debugHwnd) {
         ApplyDarkTitleBar(g_debugHwnd);
         ShowWindow(g_debugHwnd, SW_SHOW);
