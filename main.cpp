@@ -2311,29 +2311,29 @@ LRESULT CALLBACK MouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
     // ========================================================================
     // 1. РЕЖИМ ПРИВЯЗКИ КЛАВИШ
     // ========================================================================
-    if (g_bindingMode) {
-        if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN) {
-            WPARAM newKey = 0;
-            if (wParam == WM_LBUTTONDOWN) newKey = VK_LBUTTON;
-            else if (wParam == WM_RBUTTONDOWN) newKey = VK_RBUTTON;
-            else if (wParam == WM_MBUTTONDOWN) newKey = VK_MBUTTON;
-            else if (wParam == WM_XBUTTONDOWN) newKey = (HIWORD(m->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
-            
-            if (g_bindingPanKey) {
-                g_panKey = newKey;
-                g_config.panKey = g_panKey;
-            } else {
-                g_activateKey = newKey;
-                g_config.activateKey = g_activateKey;
-            }
-            SaveConfig(g_config);
-            
-            g_bindingMode = false;
-            if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
-            return 1;
-        }
-        return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
-    }
+    //if (g_bindingMode) {
+    //    if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN) {
+    //        WPARAM newKey = 0;
+    //        if (wParam == WM_LBUTTONDOWN) newKey = VK_LBUTTON;
+    //        else if (wParam == WM_RBUTTONDOWN) newKey = VK_RBUTTON;
+    //        else if (wParam == WM_MBUTTONDOWN) newKey = VK_MBUTTON;
+    //        else if (wParam == WM_XBUTTONDOWN) newKey = (HIWORD(m->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
+    //        
+    //        if (g_bindingPanKey) {
+    //            g_panKey = newKey;
+    //            g_config.panKey = g_panKey;
+    //        } else {
+    //            g_activateKey = newKey;
+    //            g_config.activateKey = g_activateKey;
+    //        }
+    //        SaveConfig(g_config);
+    //        
+    //        g_bindingMode = false;
+    //        if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
+    //        return 1;
+    //    }
+    //    return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+    //}
 
     // ========================================================================
     // 1.5. БЛОКИРОВКА ВВОДА ВО ВРЕМЯ АВТО-КАМЕРНОЙ АНИМАЦИИ
@@ -2489,21 +2489,21 @@ LRESULT CALLBACK KbHook(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode < 0) return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
     KBDLLHOOKSTRUCT* k = (KBDLLHOOKSTRUCT*)lParam;
 
-     if (g_bindingMode && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-         if (k->vkCode != VK_LWIN && k->vkCode != VK_RWIN && k->vkCode != VK_APPS) {
-             if (g_bindingPanKey) {
-                 g_panKey = k->vkCode;
-                 g_config.panKey = g_panKey;
-             } else {
-                 g_activateKey = k->vkCode;
-                 g_config.activateKey = g_activateKey;
-             }
-             SaveConfig(g_config);
-             g_bindingMode = false;
-             if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
-             return 1;
-         }
-     }
+    //if (g_bindingMode && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+    //    if (k->vkCode != VK_LWIN && k->vkCode != VK_RWIN && k->vkCode != VK_APPS) {
+    //        if (g_bindingPanKey) {
+    //            g_panKey = k->vkCode;
+    //            g_config.panKey = g_panKey;
+    //        } else {
+    //            g_activateKey = k->vkCode;
+    //            g_config.activateKey = g_activateKey;
+    //        }
+    //        SaveConfig(g_config);
+    //        g_bindingMode = false;
+    //        if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
+    //        return 1;
+    //    }
+    //}
 
     if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
         if (CheckDoubleTap(k->vkCode, true)) { HandleDoubleTapReset(); return 1; }
