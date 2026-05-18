@@ -362,9 +362,6 @@ std::chrono::steady_clock::time_point g_lastZoomTime;
 const int PHYSICS_DELAY_MS = 1000; // Задержка перед запуском физики после зума (1 секунда)
 std::atomic<bool> g_physicsScheduled{false}; // Флаг: физика запланирована
 
-std::wstring g_debugText = L"";
-CRITICAL_SECTION g_debugLock;
-
 // Double-Tap Globals
 DWORD g_lastActivateKeyPress = 0;
 DWORD g_lastActivateKeyRelease = 0;
@@ -372,45 +369,6 @@ bool g_wasActivateKeyDown = false;
 bool g_doubleTapHandled = false;
 const DWORD DOUBLE_TAP_TIMEOUT = 300;
 const DWORD HOLD_THRESHOLD = 200;
-
-// Key Binding Globals
-bool g_bindingMode = false;
-bool g_bindingPanKey = false;
-RECT g_btnBindRect = {0};
-RECT g_btnPanRect = {0};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// UI STATE — Fonts & Hover
-// ═══════════════════════════════════════════════════════════════════════════════
-HFONT g_hFontBtn = NULL;      // Segoe UI Bold  — button labels
-HFONT g_hFontDebug = NULL;    // Consolas       — debug log
-bool  g_btnBindHover = false;
-bool  g_btnPanHover = false;
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GDI CACHE — Persistent GDI objects for debug window painting
-// ═══════════════════════════════════════════════════════════════════════════════
-HDC     g_hdcMem    = NULL;
-HBITMAP g_hBmp      = NULL;
-HBITMAP g_hOldBmp   = NULL;
-HBRUSH  g_hBgBrush  = NULL;
-HPEN    g_hPen      = NULL;
-HBRUSH  g_hBrushBind[3];  // [0]=NORM, [1]=HOT, [2]=ACT
-HBRUSH  g_hBrushPan[3];   // [0]=NORM, [1]=HOT, [2]=ACT
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// THEME — Catppuccin Mocha Palette
-// ═══════════════════════════════════════════════════════════════════════════════
-// All colors are straight RGB (0–255)
-const COLORREF CLR_BG           = RGB(30,  30,  46);  // #1E1E2E — base dark
-const COLORREF CLR_BTN_BIND_NORM= RGB(137, 180, 250); // #89B4FA — blue (activate)
-const COLORREF CLR_BTN_BIND_HOT = RGB(110, 153, 242); // #6E98F2 — blue hover (darker)
-const COLORREF CLR_BTN_BIND_ACT = RGB(250, 179, 135); // #FABFB7 — peach (listening)
-const COLORREF CLR_BTN_PAN_NORM = RGB(166, 227, 161); // #A6E3A1 — green (pan)
-const COLORREF CLR_BTN_PAN_HOT  = RGB(137, 220, 128); // #89E280 — green hover (darker)
-const COLORREF CLR_BTN_PAN_ACT  = RGB(250, 179, 135); // #FABFB7 — peach (listening)
-const COLORREF CLR_TEXT         = RGB(205, 214, 244); // #CDD6F4 — primary text
-const COLORREF CLR_TEXT_DIM     = RGB(166, 173, 200); // #A6ADc8 — secondary text
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // СТРУКТУРЫ ДЛЯ ОТЛОЖЕННОЙ СТЫКОВКИ
@@ -665,249 +623,47 @@ void HandleDoubleTapReset() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ОТЛАДОЧНОЕ ОКНО
+// ОТЛАДОЧНОЕ ОКНО — ЗАГЛУШКА (будет переписано с новым UI)
 // ═══════════════════════════════════════════════════════════════════════════════
 void UpdateDebugWindow() {
-    // Пропускаем если окно скрыто — не тратим ресурсы на формирование строки
     if (!g_debugHwnd || !IsWindowVisible(g_debugHwnd)) return;
-
-    std::wstringstream ss;
-    ss << L"=== WCWM DEBUG ===\n";
-    ss << L"Camera: " << g_camOffset.x << L", " << g_camOffset.y << L"\n";
-    ss << L"Grid Anim: " << (g_gridAnim.active ? L"RUNNING" : L"IDLE") << L"\n";
-    ss << L"Zoom Anim: " << (g_zoomAnim.active ? L"RUNNING" : L"IDLE") << L"\n";
-    ss << L"Physics Scheduled: " << (g_physicsScheduled.load() ? L"YES" : L"NO") << L"\n";
-    ss << L"Last Zoom: " << (g_lastZoomWasIn.load() ? L"IN" : L"OUT") << L"\n";
-    ss << L"Windows Cached: " << g_snapshots.size() << L"\n";
-    ss << L"Activate: " << GetKeyNameStr(g_activateKey) << L"\n";
-    ss << L"Pan: " << GetKeyNameStr(g_panKey) << L"\n";
-    
-    if (g_bindingMode) {
-        ss << L"\n>>> WAITING FOR INPUT... <<<\n";
-    }
-    std::wstring newWindowNotice;
-    EnterCriticalSection(&g_debugLock);
-    newWindowNotice = g_newWindowNotice;
-    LeaveCriticalSection(&g_debugLock);
-    if (!newWindowNotice.empty()) {
-        ss << newWindowNotice << L"\n";
-    }
-    ss << L"---------------------\n";
-
-    EnterCriticalSection(&g_lock);
-    int count = 0;
-    for (const auto& s : g_snapshots) {
-        if (!IsWindow(s.hwnd)) continue;
-        if (count >= 15) { ss << L"... (and more)\n"; break; }
-        
-        wchar_t title[256] = {0};
-        GetWindowTextW(s.hwnd, title, 255);
-        if (wcslen(title) == 0) wcscpy_s(title, 256, L"<No Title>");
-
-        ss << L"[" << count << L"] " << title;
-        
-        // Показываем долг зума, если он ненулевой
-        if (std::abs(s.zoomDebt) > 0.001f) {
-            ss << L" (debt: " << std::fixed << std::setprecision(1) << (s.zoomDebt * 100.0f) << L"%)";
-        }
-        
-        ss << L"\n";
-        count++;
-    }
-    LeaveCriticalSection(&g_lock);
-
-    EnterCriticalSection(&g_debugLock);
-    g_debugText = ss.str();
-    LeaveCriticalSection(&g_debugLock);
-
-    if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, TRUE);
 }
 
 LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
-            SetWindowTextW(hwnd, L"wcwm");
-            // ─── Create persistent fonts (Segoe UI for buttons, Consolas for debug log) ───
-            g_hFontBtn   = CreateFontW(12, 0, 0, 0, FW_BOLD,   0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
-            g_hFontDebug = CreateFontW(13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, FIXED_PITCH|FF_MODERN, L"Consolas");
-
-            // ─── Create persistent GDI objects ───
-            {
-                HDC hdcScreen = GetDC(hwnd);
-                g_hdcMem = CreateCompatibleDC(hdcScreen);
-                // Bitmap will be created at WM_SIZE; create a small placeholder for now
-                g_hBmp = CreateCompatibleBitmap(hdcScreen, 1, 1);
-                g_hOldBmp = (HBITMAP)SelectObject(g_hdcMem, g_hBmp);
-                g_hBgBrush = CreateSolidBrush(CLR_BG);
-                g_hPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
-                // Button brushes: 3 states each — NORM, HOT, ACT
-                g_hBrushBind[0] = CreateSolidBrush(CLR_BTN_BIND_NORM);
-                g_hBrushBind[1] = CreateSolidBrush(CLR_BTN_BIND_HOT);
-                g_hBrushBind[2] = CreateSolidBrush(CLR_BTN_BIND_ACT);
-                g_hBrushPan[0]  = CreateSolidBrush(CLR_BTN_PAN_NORM);
-                g_hBrushPan[1]  = CreateSolidBrush(CLR_BTN_PAN_HOT);
-                g_hBrushPan[2]  = CreateSolidBrush(CLR_BTN_PAN_ACT);
-                ReleaseDC(hwnd, hdcScreen);
-            }
-
-            // Hover states default to false — harmless if window created off-screen
-            g_btnBindHover = false;
-            g_btnPanHover  = false;
+            SetWindowTextW(hwnd, L"WCWM");
             return 0;
-
-        case WM_SIZE: {
-            RECT rc; GetClientRect(hwnd, &rc);
-            // Button layout: right-aligned, 160px wide × 30px tall, 5px v-gap
-            g_btnBindRect = { rc.right - 170, 10, rc.right - 10, 40 };
-            g_btnPanRect  = { rc.right - 170, 45, rc.right - 10, 75 };
-
-            // Recreate offscreen bitmap for the new client size
-            if (g_hdcMem && g_hBmp) {
-                // Select old bitmap back before deleting it
-                SelectObject(g_hdcMem, g_hOldBmp);
-                DeleteObject(g_hBmp);
-                {
-                    HDC hdcScreen = GetDC(hwnd);
-                    g_hBmp = CreateCompatibleBitmap(hdcScreen, rc.right, rc.bottom);
-                    g_hOldBmp = (HBITMAP)SelectObject(g_hdcMem, g_hBmp);
-                    ReleaseDC(hwnd, hdcScreen);
-                }
-            }
-
-            InvalidateRect(hwnd, NULL, FALSE);  // Force full repaint after layout update
-            return 0;
-        }
-
-        case WM_MOUSEMOVE: {
-            POINT pt = { LOWORD(lParam), HIWORD(lParam) };
-            bool inBind = (PtInRect(&g_btnBindRect, pt) != 0);
-            bool inPan  = (PtInRect(&g_btnPanRect,  pt) != 0);
-            bool changed = (inBind != g_btnBindHover) || (inPan != g_btnPanHover);
-            if (changed) {
-                g_btnBindHover = inBind;
-                g_btnPanHover  = inPan;
-                InvalidateRect(hwnd, NULL, FALSE);  // repaint only if state changed
-            }
-            return 0;
-        }
-
-        case WM_LBUTTONDOWN: {
-            int x = LOWORD(lParam); int y = HIWORD(lParam);
-            //if (x >= g_btnBindRect.left && x <= g_btnBindRect.right && y >= g_btnBindRect.top && y <= g_btnBindRect.bottom) {
-            //    g_bindingMode = true; g_bindingPanKey = false;
-            //    if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, FALSE);
-            //} else if (x >= g_btnPanRect.left && x <= g_btnPanRect.right && y >= g_btnPanRect.top && y <= g_btnPanRect.bottom) {
-            //    g_bindingMode = true; g_bindingPanKey = true;
-            //    if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, FALSE);
-            //}
-            return 0;
-        }
 
         case WM_ERASEBKGND:
-            return TRUE;  // Suppress default background erase — we handle it in WM_PAINT
+            return TRUE;
 
         case WM_PAINT: {
-            PAINTSTRUCT ps; BeginPaint(hwnd, &ps);
+            PAINTSTRUCT ps; 
+            BeginPaint(hwnd, &ps);
             RECT rc; GetClientRect(hwnd, &rc);
-
-            // ─── Resize bitmap if needed (handles initial 1×1 placeholder) ───
-            if (g_hdcMem && g_hBmp) {
-                BITMAP bmpInfo;
-                GetObject(g_hBmp, sizeof(BITMAP), &bmpInfo);
-                if (bmpInfo.bmWidth != rc.right || bmpInfo.bmHeight != rc.bottom) {
-                    SelectObject(g_hdcMem, g_hOldBmp);
-                    DeleteObject(g_hBmp);
-                    HDC hdcScreen = GetDC(hwnd);
-                    g_hBmp = CreateCompatibleBitmap(hdcScreen, rc.right, rc.bottom);
-                    g_hOldBmp = (HBITMAP)SelectObject(g_hdcMem, g_hBmp);
-                    ReleaseDC(hwnd, hdcScreen);
-                }
-            }
-
-            // ─── Background ───────────────────────────────────────
-            FillRect(g_hdcMem, &rc, g_hBgBrush);
-
-            //// ─── Button: Set Activate ──────────────────────────────
-            //int bindState = 0; // 0=NORM, 1=HOT, 2=ACT
-            //if (g_bindingMode && !g_bindingPanKey)      bindState = 2;
-            //else if (g_btnBindHover && !g_bindingMode)  bindState = 1;
-//
-            //SelectObject(g_hdcMem, g_hBrushBind[bindState]);
-            //RoundRect(g_hdcMem, g_btnBindRect.left, g_btnBindRect.top,
-            //                g_btnBindRect.right, g_btnBindRect.bottom, 8, 8);
-//
-            //// Draw border
-            //HPEN hOldPen = (HPEN)SelectObject(g_hdcMem, g_hPen);
-            //HBRUSH hOldBrush = (HBRUSH)SelectObject(g_hdcMem, (HBRUSH)GetStockObject(NULL_BRUSH));
-            //RoundRect(g_hdcMem, g_btnBindRect.left, g_btnBindRect.top,
-            //                g_btnBindRect.right, g_btnBindRect.bottom, 8, 8);
-            //SelectObject(g_hdcMem, hOldBrush);
-            //SelectObject(g_hdcMem, hOldPen);
-//
-            //// ─── Button: Set Pan Key ───────────────────────────────
-            //int panState = 0;
-            //if (g_bindingMode && g_bindingPanKey)       panState = 2;
-            //else if (g_btnPanHover && !g_bindingMode)   panState = 1;
-//
-            //SelectObject(g_hdcMem, g_hBrushPan[panState]);
-            //RoundRect(g_hdcMem, g_btnPanRect.left, g_btnPanRect.top,
-            //                g_btnPanRect.right, g_btnPanRect.bottom, 8, 8);
-            //hOldPen   = (HPEN)SelectObject(g_hdcMem, g_hPen);
-            //hOldBrush = (HBRUSH)SelectObject(g_hdcMem, (HBRUSH)GetStockObject(NULL_BRUSH));
-            //RoundRect(g_hdcMem, g_btnPanRect.left, g_btnPanRect.top,
-            //                g_btnPanRect.right, g_btnPanRect.bottom, 8, 8);
-            //SelectObject(g_hdcMem, hOldBrush);
-            //SelectObject(g_hdcMem, hOldPen);
-//
-            //// Select bind brush back (doesn't matter for correctness but keeps state clean)
-            //SelectObject(g_hdcMem, g_hBrushBind[bindState]);
-//
-            //// ─── Button Text (Segoe UI Bold) ──────────────────────
-            //SetBkMode(g_hdcMem, TRANSPARENT);
-            //SetTextColor(g_hdcMem, CLR_TEXT);
-            //HFONT hOldFontBtn = (HFONT)SelectObject(g_hdcMem, g_hFontBtn);
-            ////DrawTextW(g_hdcMem, (g_bindingMode && !g_bindingPanKey) ? L"LISTENING..." : L"Set Activate",
-            ////          -1, &g_btnBindRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            ////DrawTextW(g_hdcMem, (g_bindingMode && g_bindingPanKey) ? L"LISTENING..." : L"Set Pan Key",
-            ////          -1, &g_btnPanRect,  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            //SelectObject(g_hdcMem, hOldFontBtn);
-//
-            //// ─── Debug Log Text (Consolas) ────────────────────────
-            //HFONT hOldFontDbg = (HFONT)SelectObject(g_hdcMem, g_hFontDebug);
-            //SetTextColor(g_hdcMem, CLR_TEXT_DIM);
-            //RECT tr = { 10, 85, rc.right - 10, rc.bottom - 10 };
-            //EnterCriticalSection(&g_debugLock);
-            //std::wstring t = g_debugText;
-            //LeaveCriticalSection(&g_debugLock);
-            //DrawTextW(g_hdcMem, t.c_str(), -1, &tr, DT_LEFT | DT_TOP | DT_WORDBREAK);
-            //SelectObject(g_hdcMem, hOldFontDbg);
-
-
-            // ─── Blit memory → screen ─────────────────────────────
-            HDC hdc = GetDC(hwnd);
-            BitBlt(hdc, 0, 0, rc.right, rc.bottom, g_hdcMem, 0, 0, SRCCOPY);
-            ReleaseDC(hwnd, hdc);
-
+            
+            HBRUSH hBrush = CreateSolidBrush(RGB(30, 30, 46));
+            FillRect(ps.hdc, &rc, hBrush);
+            DeleteObject(hBrush);
+            
             EndPaint(hwnd, &ps);
             return 0;
         }
 
         case WM_CLOSE:
-            // Скрываем окно вместо уничтожения — остаёмся в трее
             ShowWindow(hwnd, SW_HIDE);
             return 0;
 
         case WM_COMMAND: {
             WORD cmd = LOWORD(wParam);
             if (cmd == ID_TRAY_OPEN) {
-                // Восстанавливаем окно из трея
                 ShowWindow(hwnd, SW_SHOW);
                 if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
                 return 0;
             }
             if (cmd == ID_TRAY_EXIT) {
-                // Полное завершение приложения с очисткой ресурсов
                 if (g_trayIcon.hWnd) {
                     Shell_NotifyIconW(NIM_DELETE, &g_trayIcon);
                     ZeroMemory(&g_trayIcon, sizeof(g_trayIcon));
@@ -917,9 +673,7 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 g_stop.store(true);
                 if (g_worker.joinable()) g_worker.join();
                 DeleteCriticalSection(&g_lock);
-                DeleteCriticalSection(&g_debugLock);
                 if (g_hSingleInstanceMutex) { CloseHandle(g_hSingleInstanceMutex); g_hSingleInstanceMutex = NULL; }
-                // Сохраняем конфиг перед выходом
                 g_config.activateKey = g_activateKey;
                 g_config.panKey = g_panKey;
                 SaveConfig(g_config);
@@ -932,20 +686,18 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         case WM_TRAYICON:
             if (lParam == WM_RBUTTONUP) {
-                // Показываем контекстное меню у курсора
                 HMENU hMenu = CreatePopupMenu();
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN,  L"Open");
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT,  L"Exit");
                 POINT pt;
                 GetCursorPos(&pt);
-                SetForegroundWindow(hwnd); // Ensure our window is foreground before menu
+                SetForegroundWindow(hwnd);
                 TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
                 DestroyMenu(hMenu);
-                PostMessageW(hwnd, WM_NULL, 0, 0); // Prevent menu from sticking
+                PostMessageW(hwnd, WM_NULL, 0, 0);
                 return 0;
             }
             if (lParam == WM_LBUTTONDBLCLK) {
-                // Двойной клик — показать окно
                 ShowWindow(hwnd, SW_SHOW);
                 if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
@@ -954,28 +706,11 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
 
         case WM_DESTROY:
-            // Clean up GDI objects — select original bitmap back before deleting
-            if (g_hdcMem && g_hOldBmp) {
-                SelectObject(g_hdcMem, g_hOldBmp);
-            }
-            if (g_hBmp)    { DeleteObject(g_hBmp);    g_hBmp    = NULL; }
-            if (g_hdcMem)  { DeleteDC(g_hdcMem);      g_hdcMem  = NULL; }
-            if (g_hPen)    { DeleteObject(g_hPen);     g_hPen    = NULL; }
-            if (g_hBgBrush){ DeleteObject(g_hBgBrush); g_hBgBrush= NULL; }
-            for (int i = 0; i < 3; ++i) {
-                if (g_hBrushBind[i]) { DeleteObject(g_hBrushBind[i]); g_hBrushBind[i] = NULL; }
-                if (g_hBrushPan[i])  { DeleteObject(g_hBrushPan[i]);  g_hBrushPan[i]  = NULL; }
-            }
-            // Удаляем tray icon чтобы не оставался "мёртвый" значок в трее
             if (g_trayIcon.hWnd) {
                 Shell_NotifyIconW(NIM_DELETE, &g_trayIcon);
                 ZeroMemory(&g_trayIcon, sizeof(g_trayIcon));
             }
-            // Clean up fonts to avoid GDI leaks
-            if (g_hFontBtn)   { DeleteObject(g_hFontBtn);   g_hFontBtn   = NULL; }
-            if (g_hFontDebug) { DeleteObject(g_hFontDebug); g_hFontDebug = NULL; }
             g_debugHwnd = NULL;
-            // NOT calling PostQuitMessage here — app continues with overlay only
             return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -1550,11 +1285,6 @@ while (!g_stop.load()) {
                                g_autoCamAnim.store(true);
 
                                LeaveCriticalSection(&g_lock);
-
-                               std::wstring noticeMsg = ctx.notice + L" -> DEFERRED DOCKING";
-                               EnterCriticalSection(&g_debugLock);
-                               g_newWindowNotice = noticeMsg;
-                               LeaveCriticalSection(&g_debugLock);
                            } else {
                                // НЕАКТИВНОЕ: Сразу в сетку
                                g_newWindowsFound.push_back(ctx.newHwnd);
@@ -1574,11 +1304,6 @@ while (!g_stop.load()) {
                                g_gridAnim.active = true;
 
                                LeaveCriticalSection(&g_lock);
-
-                               std::wstring noticeMsg = ctx.notice + L" -> ANIMATING TO GRID";
-                               EnterCriticalSection(&g_debugLock);
-                               g_newWindowNotice = noticeMsg;
-                               LeaveCriticalSection(&g_debugLock);
                            }
                        }
                    }
@@ -1659,11 +1384,6 @@ while (!g_stop.load()) {
                            g_autoCamAnim.store(true);
 
                            LeaveCriticalSection(&g_lock);
-
-                           std::wstring noticeMsg = ctx.notice + L" -> DEFERRED DOCKING";
-                           EnterCriticalSection(&g_debugLock);
-                           g_newWindowNotice = noticeMsg;
-                           LeaveCriticalSection(&g_debugLock);
                        } else {
                            g_newWindowsFound.push_back(ctx.newHwnd);
                            POINT targetPos = FindBestSpot(ctx.newHwnd, w, h, g_snapshots, g_camOffset);
@@ -1682,11 +1402,6 @@ while (!g_stop.load()) {
                            g_gridAnim.active = true;
 
                            LeaveCriticalSection(&g_lock);
-
-                           std::wstring noticeMsg = ctx.notice + L" -> ANIMATING TO GRID";
-                           EnterCriticalSection(&g_debugLock);
-                           g_newWindowNotice = noticeMsg;
-                           LeaveCriticalSection(&g_debugLock);
                        }
                    }
                }
@@ -2822,7 +2537,6 @@ LRESULT CALLBACK KbHook(int nCode, WPARAM wParam, LPARAM lParam) {
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CREATE) {
         InitializeCriticalSection(&g_lock);
-        InitializeCriticalSection(&g_debugLock);
         g_snapshots.reserve(128);
         g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, NULL, 0);
         g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbHook, NULL, 0);
@@ -2843,7 +2557,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_mouseHook = NULL; g_kbHook = NULL;
         if (g_worker.joinable()) g_worker.join();
         DeleteCriticalSection(&g_lock);
-        DeleteCriticalSection(&g_debugLock);
 
         // Освобождаем мьютекс единственного экземпляра
         if (g_hSingleInstanceMutex) {
