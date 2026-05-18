@@ -1,5 +1,1 @@
-Nothing needs to be added to .gitignore since only a source code file (main.cpp) was modified and no build artifacts, dependencies, or temporary files were detected in the changes.
-Идеи.txt
-AGENTS.md
-app_icon.ico
-.kilo
+Nothing needs to be added to .gitignore since only a source code file (main.cpp) was modified and there are no build artifacts, dependencies, or temporary files in the changes.
