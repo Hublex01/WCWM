@@ -793,13 +793,13 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         case WM_LBUTTONDOWN: {
             int x = LOWORD(lParam); int y = HIWORD(lParam);
-            if (x >= g_btnBindRect.left && x <= g_btnBindRect.right && y >= g_btnBindRect.top && y <= g_btnBindRect.bottom) {
-                g_bindingMode = true; g_bindingPanKey = false;
-                if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, FALSE);
-            } else if (x >= g_btnPanRect.left && x <= g_btnPanRect.right && y >= g_btnPanRect.top && y <= g_btnPanRect.bottom) {
-                g_bindingMode = true; g_bindingPanKey = true;
-                if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, FALSE);
-            }
+            //if (x >= g_btnBindRect.left && x <= g_btnBindRect.right && y >= g_btnBindRect.top && y <= g_btnBindRect.bottom) {
+            //    g_bindingMode = true; g_bindingPanKey = false;
+            //    if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, FALSE);
+            //} else if (x >= g_btnPanRect.left && x <= g_btnPanRect.right && y >= g_btnPanRect.top && y <= g_btnPanRect.bottom) {
+            //    g_bindingMode = true; g_bindingPanKey = true;
+            //    if (g_debugHwnd) InvalidateRect(g_debugHwnd, NULL, FALSE);
+            //}
             return 0;
         }
 
@@ -827,60 +827,61 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // ─── Background ───────────────────────────────────────
             FillRect(g_hdcMem, &rc, g_hBgBrush);
 
-            // ─── Button: Set Activate ──────────────────────────────
-            int bindState = 0; // 0=NORM, 1=HOT, 2=ACT
-            if (g_bindingMode && !g_bindingPanKey)      bindState = 2;
-            else if (g_btnBindHover && !g_bindingMode)  bindState = 1;
+            //// ─── Button: Set Activate ──────────────────────────────
+            //int bindState = 0; // 0=NORM, 1=HOT, 2=ACT
+            //if (g_bindingMode && !g_bindingPanKey)      bindState = 2;
+            //else if (g_btnBindHover && !g_bindingMode)  bindState = 1;
+//
+            //SelectObject(g_hdcMem, g_hBrushBind[bindState]);
+            //RoundRect(g_hdcMem, g_btnBindRect.left, g_btnBindRect.top,
+            //                g_btnBindRect.right, g_btnBindRect.bottom, 8, 8);
+//
+            //// Draw border
+            //HPEN hOldPen = (HPEN)SelectObject(g_hdcMem, g_hPen);
+            //HBRUSH hOldBrush = (HBRUSH)SelectObject(g_hdcMem, (HBRUSH)GetStockObject(NULL_BRUSH));
+            //RoundRect(g_hdcMem, g_btnBindRect.left, g_btnBindRect.top,
+            //                g_btnBindRect.right, g_btnBindRect.bottom, 8, 8);
+            //SelectObject(g_hdcMem, hOldBrush);
+            //SelectObject(g_hdcMem, hOldPen);
+//
+            //// ─── Button: Set Pan Key ───────────────────────────────
+            //int panState = 0;
+            //if (g_bindingMode && g_bindingPanKey)       panState = 2;
+            //else if (g_btnPanHover && !g_bindingMode)   panState = 1;
+//
+            //SelectObject(g_hdcMem, g_hBrushPan[panState]);
+            //RoundRect(g_hdcMem, g_btnPanRect.left, g_btnPanRect.top,
+            //                g_btnPanRect.right, g_btnPanRect.bottom, 8, 8);
+            //hOldPen   = (HPEN)SelectObject(g_hdcMem, g_hPen);
+            //hOldBrush = (HBRUSH)SelectObject(g_hdcMem, (HBRUSH)GetStockObject(NULL_BRUSH));
+            //RoundRect(g_hdcMem, g_btnPanRect.left, g_btnPanRect.top,
+            //                g_btnPanRect.right, g_btnPanRect.bottom, 8, 8);
+            //SelectObject(g_hdcMem, hOldBrush);
+            //SelectObject(g_hdcMem, hOldPen);
+//
+            //// Select bind brush back (doesn't matter for correctness but keeps state clean)
+            //SelectObject(g_hdcMem, g_hBrushBind[bindState]);
+//
+            //// ─── Button Text (Segoe UI Bold) ──────────────────────
+            //SetBkMode(g_hdcMem, TRANSPARENT);
+            //SetTextColor(g_hdcMem, CLR_TEXT);
+            //HFONT hOldFontBtn = (HFONT)SelectObject(g_hdcMem, g_hFontBtn);
+            ////DrawTextW(g_hdcMem, (g_bindingMode && !g_bindingPanKey) ? L"LISTENING..." : L"Set Activate",
+            ////          -1, &g_btnBindRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            ////DrawTextW(g_hdcMem, (g_bindingMode && g_bindingPanKey) ? L"LISTENING..." : L"Set Pan Key",
+            ////          -1, &g_btnPanRect,  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            //SelectObject(g_hdcMem, hOldFontBtn);
+//
+            //// ─── Debug Log Text (Consolas) ────────────────────────
+            //HFONT hOldFontDbg = (HFONT)SelectObject(g_hdcMem, g_hFontDebug);
+            //SetTextColor(g_hdcMem, CLR_TEXT_DIM);
+            //RECT tr = { 10, 85, rc.right - 10, rc.bottom - 10 };
+            //EnterCriticalSection(&g_debugLock);
+            //std::wstring t = g_debugText;
+            //LeaveCriticalSection(&g_debugLock);
+            //DrawTextW(g_hdcMem, t.c_str(), -1, &tr, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            //SelectObject(g_hdcMem, hOldFontDbg);
 
-            SelectObject(g_hdcMem, g_hBrushBind[bindState]);
-            RoundRect(g_hdcMem, g_btnBindRect.left, g_btnBindRect.top,
-                            g_btnBindRect.right, g_btnBindRect.bottom, 8, 8);
-
-            // Draw border
-            HPEN hOldPen = (HPEN)SelectObject(g_hdcMem, g_hPen);
-            HBRUSH hOldBrush = (HBRUSH)SelectObject(g_hdcMem, (HBRUSH)GetStockObject(NULL_BRUSH));
-            RoundRect(g_hdcMem, g_btnBindRect.left, g_btnBindRect.top,
-                            g_btnBindRect.right, g_btnBindRect.bottom, 8, 8);
-            SelectObject(g_hdcMem, hOldBrush);
-            SelectObject(g_hdcMem, hOldPen);
-
-            // ─── Button: Set Pan Key ───────────────────────────────
-            int panState = 0;
-            if (g_bindingMode && g_bindingPanKey)       panState = 2;
-            else if (g_btnPanHover && !g_bindingMode)   panState = 1;
-
-            SelectObject(g_hdcMem, g_hBrushPan[panState]);
-            RoundRect(g_hdcMem, g_btnPanRect.left, g_btnPanRect.top,
-                            g_btnPanRect.right, g_btnPanRect.bottom, 8, 8);
-            hOldPen   = (HPEN)SelectObject(g_hdcMem, g_hPen);
-            hOldBrush = (HBRUSH)SelectObject(g_hdcMem, (HBRUSH)GetStockObject(NULL_BRUSH));
-            RoundRect(g_hdcMem, g_btnPanRect.left, g_btnPanRect.top,
-                            g_btnPanRect.right, g_btnPanRect.bottom, 8, 8);
-            SelectObject(g_hdcMem, hOldBrush);
-            SelectObject(g_hdcMem, hOldPen);
-
-            // Select bind brush back (doesn't matter for correctness but keeps state clean)
-            SelectObject(g_hdcMem, g_hBrushBind[bindState]);
-
-            // ─── Button Text (Segoe UI Bold) ──────────────────────
-            SetBkMode(g_hdcMem, TRANSPARENT);
-            SetTextColor(g_hdcMem, CLR_TEXT);
-            HFONT hOldFontBtn = (HFONT)SelectObject(g_hdcMem, g_hFontBtn);
-            DrawTextW(g_hdcMem, (g_bindingMode && !g_bindingPanKey) ? L"LISTENING..." : L"Set Activate",
-                      -1, &g_btnBindRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            DrawTextW(g_hdcMem, (g_bindingMode && g_bindingPanKey) ? L"LISTENING..." : L"Set Pan Key",
-                      -1, &g_btnPanRect,  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(g_hdcMem, hOldFontBtn);
-
-            // ─── Debug Log Text (Consolas) ────────────────────────
-            HFONT hOldFontDbg = (HFONT)SelectObject(g_hdcMem, g_hFontDebug);
-            SetTextColor(g_hdcMem, CLR_TEXT_DIM);
-            RECT tr = { 10, 85, rc.right - 10, rc.bottom - 10 };
-            EnterCriticalSection(&g_debugLock);
-            std::wstring t = g_debugText;
-            LeaveCriticalSection(&g_debugLock);
-            DrawTextW(g_hdcMem, t.c_str(), -1, &tr, DT_LEFT | DT_TOP | DT_WORDBREAK);
-            SelectObject(g_hdcMem, hOldFontDbg);
 
             // ─── Blit memory → screen ─────────────────────────────
             HDC hdc = GetDC(hwnd);
