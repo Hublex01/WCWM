@@ -1,70 +1,17 @@
-```
-# Compiled and build artifacts
-*.o
-*.obj
-*.exe
-*.dll
-*.so
-*.a
-*.out
-
-# Dependencies
-venv/
-.venv/
-__pycache__/
-.mypy_cache/
-.pytest_cache/
-node_modules/
-dist/
-build/
-target/
-.gradle/
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-*.swo
-
-# Environment
-.env
-.env.local
-*.env.*
-
-# Editors
-.vscode/
-.idea/
-
-# System files
-.DS_Store
-Thumbs.db
-
-# Coverage
-coverage/
-htmlcov/
-.coverage
-
-# Compressed files
-*.zip
-*.gz
-*.tar
-*.tgz
-*.bz2
-*.xz
-*.7z
-*.rar
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
-*.Z
-*.lz
-*.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
-```
+Nothing needs to be added to .gitignore since only a source code file (main.cpp) was modified and there are no build artifacts, dependencies, or temporary files in the changes.
+AGENTS.md
+app_icon.ico
+Идеи.txt
+.kilo/agent/architecture.md
+.kilo/agent/code.md
+.kilo/agent/debugger.md
+.kilo/agent/designer.md
+.kilo/command/build.md
+.kilo/command/design-review.md
+.kilo/command/workflow-icon.md
+.kilo/plans/1778478011840-stellar-rocket.md
+.kilo/plans/1778479108818-lucky-engine.md
+.kilo/plans/1778481660558-calm-cactus.md
+.kilo/plans/1778486193560-cosmic-panda.md
+.kilo/plans/1778496960692-stellar-rocket.md
+.kilo/plans/1778517265308-misty-lagoon.md
