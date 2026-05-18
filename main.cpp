@@ -207,7 +207,7 @@ void SaveConfig(const Config& cfg) {
 Config g_config;
 
 WPARAM g_activateKey = VK_RCONTROL;
-WPARAM g_panKey = 0;
+WPARAM g_panKey = VK_XBUTTON2;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // СТРУКТУРЫ
